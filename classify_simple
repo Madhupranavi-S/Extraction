@@ -12,17 +12,19 @@ import cv2
 
 # --- Classification ---
 def classify(temp_c):
-    if temp_c < 34.0:
+    if temp_c < 30.0:
         return "NO FACE", (128, 128, 128)
-    elif temp_c < 37.5:
+    elif temp_c < 36.0:
         return "NORMAL", (0, 255, 0)
-    elif temp_c < 38.5:
+    elif temp_c < 37.5:
         return "LOW FEVER", (0, 165, 255)
-    else:
+    elif temp_c < 39.0:
         return "HIGH FEVER", (0, 0, 255)
+    else:
+        return "EMERGENCY", (0, 0, 180)
 
 # --- State ---
-linear_cal = g.CameraLinearCal()
+linear_cal  = g.CameraLinearCal()
 last_status = [None]
 last_frame  = [None]
 
@@ -36,7 +38,7 @@ def on_frame(frame):
 
 # --- Start camera ---
 cam = g.Camera(g.DeviceInfo(serial_port="/dev/ttyACM0"))
-cam.configure_thermography(g.ThermographyConfig(emissivity=95))
+cam.configure_thermography(g.ThermographyConfig(emissivity=98))
 cam.start(on_frame)
 print("Warming up... please wait")
 time.sleep(3)
@@ -60,54 +62,57 @@ try:
             time.sleep(1)
             continue
 
-        # Decode full temperature array
-        temps = linear_cal.decode(last_frame[0].y16)
-        h, w  = temps.shape
+        # --- Collect 10 readings and average for stability ---
+        readings = []
+        best_pos = (last_frame[0].y16.shape[0] // 2,
+                    last_frame[0].y16.shape[1] // 2)
 
-        # --- Find face region ---
-        # Smooth the temp array to reduce noise
-        temps_smooth = temps.copy()
+        for _ in range(10):
+            if last_frame[0] is not None and linear_cal.ready():
+                temps = linear_cal.decode(last_frame[0].y16)
+                readings.append(float(np.max(temps)))
+                best_pos = np.unravel_index(
+                    np.argmax(temps), temps.shape)
+            time.sleep(0.1)
 
-        # Only look at pixels above 32°C (likely skin)
-        face_mask = temps_smooth > 32.0
-
-        # Find the hottest 5x5 region average (more stable than single pixel)
-        best_temp = 0
-        best_pos  = (h//2, w//2)
-        step = 5
-        for row in range(0, h - step, step):
-            for col in range(0, w - step, step):
-                region = temps[row:row+step, col:col+step]
-                if np.mean(region) > best_temp:
-                    best_temp = float(np.mean(region))
-                    best_pos  = (row + step//2, col + step//2)
+        best_temp = float(np.mean(readings)) if readings else 0.0
 
         # --- Classify ---
         label, color = classify(best_temp)
 
         # --- Build display image ---
-        # Apply palette (IronRed)
+        temps  = linear_cal.decode(last_frame[0].y16)
+        h, w   = temps.shape
         palette = g.Palette.IronRed
         opts    = g.PaletteOptions(auto_range=True)
         rgb     = g.apply_palette(last_frame[0].y16, palette, opts)
         display = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-        display = cv2.resize(display, (w*2, h*2))  # 2x zoom
+        display = cv2.resize(display, (w * 2, h * 2))
 
         # Draw crosshair on hotspot
-        cx = best_pos[1] * 2
-        cy = best_pos[0] * 2
+        cx = int(best_pos[1]) * 2
+        cy = int(best_pos[0]) * 2
         cv2.circle(display, (cx, cy), 15, color, 2)
-        cv2.line(display, (cx-20, cy), (cx+20, cy), color, 1)
-        cv2.line(display, (cx, cy-20), (cx, cy+20), color, 1)
+        cv2.line(display, (cx - 20, cy), (cx + 20, cy), color, 1)
+        cv2.line(display, (cx, cy - 20), (cx, cy + 20), color, 1)
 
-        # Draw temperature and status text
-        cv2.putText(display, f"{best_temp:.1f} C", (cx+18, cy-8),
+        # Draw temperature and status
+        cv2.putText(display, f"{best_temp:.1f} C",
+                    (cx + 18, cy - 8),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-        cv2.putText(display, label, (20, 40),
+        cv2.putText(display, label,
+                    (20, 40),
                     cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 2)
-        cv2.putText(display, f"min:{last_status[0].min_c:.1f} max:{last_status[0].max_c:.1f}",
-                    (20, h*2 - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200,200,200), 1)
+
+        # Draw min/max at bottom
+        if last_status[0] is not None:
+            cv2.putText(display,
+                        f"min:{last_status[0].min_c:.1f}  "
+                        f"max:{last_status[0].max_c:.1f}  "
+                        f"avg of 10 frames",
+                        (20, h * 2 - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                        (200, 200, 200), 1)
 
         # Show window
         cv2.imshow("Thermal Health Monitor", display)
