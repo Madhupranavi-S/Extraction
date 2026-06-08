@@ -36,7 +36,6 @@ cam.start(on_frame)
 print("Warming up... 5 seconds")
 time.sleep(5)
 
-# Keep retrying calibration until ready
 print("Waiting for calibration...")
 for attempt in range(20):
     try:
@@ -57,13 +56,11 @@ if not linear_cal.ready():
     cam.stop()
     sys.exit(1)
 
-# Now run detection loop
-print("Running detection — point sensor at face, press Ctrl+C to stop")
+print("Running — point sensor at face, Ctrl+C to stop")
 print("-" * 60)
 
 try:
     while True:
-        # Refresh calibration
         try:
             s = cam.serial().query_temp_status(retries=1, wait_seconds=1.0)
             if s:
@@ -73,18 +70,17 @@ try:
             pass
 
         if last_frame[0] is None:
-            print("No frame yet...")
             time.sleep(1)
             continue
 
         temps  = linear_cal.decode(last_frame[0].y16)
         h, w   = temps.shape
+
         t_min  = float(temps.min())
         t_max  = float(temps.max())
         spread = t_max - t_min
 
-        # Clip to body temp range and normalise
-        # This makes face bright and background dark
+        # Clip to body temp range — makes face bright
         clip_min = 28.0
         clip_max = 38.0
         temps_clipped = np.clip(temps, clip_min, clip_max)
@@ -92,42 +88,83 @@ try:
                 (clip_max - clip_min) * 255).astype(np.uint8)
 
         # Run T-FAKE
-        landmarks, confidences = landmarker.process(gray)
+        try:
+            landmarks, confidences = landmarker.process(gray)
+        except Exception as e:
+            print(f"Error: {e}")
+            time.sleep(2)
+            continue
 
         if landmarks is not None:
-            lms   = np.array(landmarks,   dtype=np.float32)
-            confs = np.array(confidences, dtype=np.float32).flatten()
+            # landmarks is a list of detections
+            # each detection is an array of shape (478, 2)
+            print(f"Type: {type(landmarks)}")
+            print(f"Len: {len(landmarks)}")
 
-            valid_mask  = (lms[:, 0] >= 0) & (lms[:, 1] >= 0)
-            valid_count = int(valid_mask.sum())
-            max_conf    = float(confs.max())
+            if isinstance(landmarks, list):
+                # Multiple faces possible — take first one
+                if len(landmarks) > 0:
+                    lms = np.array(landmarks[0], dtype=np.float32)
+                    confs = np.array(confidences[0], dtype=np.float32).flatten() \
+                            if isinstance(confidences, list) else \
+                            np.array(confidences, dtype=np.float32).flatten()
+                else:
+                    print("Empty landmarks list")
+                    time.sleep(2)
+                    continue
+            else:
+                lms   = np.array(landmarks,   dtype=np.float32)
+                confs = np.array(confidences, dtype=np.float32).flatten()
 
-            print(f"spread:{spread:.1f}C  "
-                  f"valid:{valid_count}/478  "
-                  f"max_conf:{max_conf:.4f}")
+            print(f"lms shape: {lms.shape}")
+            print(f"lms max x: {lms[:, 0].max():.1f}  "
+                  f"max y: {lms[:, 1].max():.1f}")
+            print(f"Frame size: {w}x{h}")
 
-            # Print landmark format info once
-            if valid_count > 0:
-                first_valid = np.where(valid_mask)[0][0]
-                print(f"  landmark[{first_valid}] = "
-                      f"{lms[first_valid]}  "
-                      f"type:{type(lms[first_valid][0])}")
+            # Figure out the scale factor
+            # T-FAKE processes at 224x224 internally
+            # Landmarks are in that space — scale back to our frame
+            internal_w = lms[:, 0].max()
+            internal_h = lms[:, 1].max()
+            scale_x = w / internal_w if internal_w > 0 else 1.0
+            scale_y = h / internal_h if internal_h > 0 else 1.0
 
-                # Inner canthus temps
-                for idx, name in [(133, "L-canthus"),
-                                  (362, "R-canthus"),
-                                  (10,  "Forehead")]:
-                    if valid_mask[idx]:
-                        px = int(lms[idx, 0])
-                        py = int(lms[idx, 1])
-                        if 0 <= px < w and 0 <= py < h:
-                            t = float(temps[py, px])
-                            print(f"  {name}: "
-                                  f"pixel({px},{py}) "
-                                  f"temp:{t:.1f}C")
+            print(f"Scale factors: x={scale_x:.3f} y={scale_y:.3f}")
+
+            # Scale landmarks to our frame
+            lms_scaled = lms.copy()
+            lms_scaled[:, 0] *= scale_x
+            lms_scaled[:, 1] *= scale_y
+
+            # Read temperature at key landmarks
+            for idx, name in [(133, "L-canthus"),
+                              (362, "R-canthus"),
+                              (10,  "Forehead"),
+                              (1,   "Nose tip")]:
+                if idx < len(lms_scaled):
+                    px = int(lms_scaled[idx, 0])
+                    py = int(lms_scaled[idx, 1])
+                    if 0 <= px < w and 0 <= py < h:
+                        # Average 3x3 region
+                        r = 3
+                        region = temps[
+                            max(0, py-r):min(h, py+r),
+                            max(0, px-r):min(w, px+r)]
+                        t = float(np.max(region))
+                        print(f"  {name}: "
+                              f"pixel({px},{py}) "
+                              f"temp:{t:.1f}C")
+                    else:
+                        print(f"  {name}: out of bounds "
+                              f"({px},{py})")
+
+            spread_str = f"spread:{spread:.1f}C"
+            print(f"{spread_str}  landmarks:{len(lms)}")
+
         else:
             print(f"spread:{spread:.1f}C  NO DETECTION")
 
+        print("-" * 40)
         time.sleep(2)
 
 except KeyboardInterrupt:
