@@ -1,0 +1,280 @@
+import sys
+import time
+sys.path.insert(0, 'build/python')
+
+import guideusb2 as g
+import numpy as np
+import cv2
+from tfan import ThermalLandmarks
+
+# --- T-FAKE internal processing size ---
+TFAKE_SIZE = 224
+
+# --- Landmark indices (MediaPipe 478-point convention) ---
+LEFT_INNER_CANTHUS  = 133
+RIGHT_INNER_CANTHUS = 362
+FOREHEAD_TOP        = 10
+NOSE_TIP            = 1
+
+# --- Literature-backed thresholds (SPIRIT 2025) ---
+THRESH_NO_FACE    = 28.0
+THRESH_NORMAL     = 37.1
+THRESH_LOW_FEVER  = 37.5
+THRESH_HIGH_FEVER = 39.0
+
+def classify(temp_c):
+    if temp_c < THRESH_NO_FACE:
+        return "NO FACE", (128, 128, 128)
+    elif temp_c < THRESH_NORMAL:
+        return "NORMAL", (0, 255, 0)
+    elif temp_c < THRESH_LOW_FEVER:
+        return "LOW FEVER", (0, 165, 255)
+    elif temp_c < THRESH_HIGH_FEVER:
+        return "HIGH FEVER", (0, 0, 255)
+    else:
+        return "EMERGENCY", (0, 0, 180)
+
+def get_region_temp(temps, px, py, radius=3):
+    h, w = temps.shape
+    x1 = max(0, px - radius)
+    x2 = min(w, px + radius)
+    y1 = max(0, py - radius)
+    y2 = min(h, py + radius)
+    region = temps[y1:y2, x1:x2]
+    return float(np.max(region)) if region.size > 0 else 0.0
+
+def scale_landmarks(lms, orig_w, orig_h):
+    """Scale T-FAKE landmarks from 224x224 space to original frame size."""
+    scaled = lms.copy()
+    scaled[:, 0] = lms[:, 0] * orig_w / TFAKE_SIZE
+    scaled[:, 1] = lms[:, 1] * orig_h / TFAKE_SIZE
+    return scaled
+
+# --- State ---
+# --- Temporal smoothing ---
+last_valid_reading = [None]   # stores last good temp reading
+no_detect_count    = [0]      # counts consecutive no-face frames
+MAX_NO_DETECT      = 3        # hold last reading for this many misses
+
+def on_frame(frame):
+    last_frame[0] = frame
+    if last_status[0] is not None:
+        try:
+            linear_cal.fit(frame.y16, last_status[0])
+        except:
+            pass
+
+# --- Init T-FAKE ---
+print("Loading T-FAKE model...")
+landmarker = ThermalLandmarks(device="cpu", n_landmarks=478)
+print("T-FAKE ready.")
+
+# --- Start camera ---
+cam = g.Camera(g.DeviceInfo(serial_port="/dev/ttyACM0"))
+cam.configure_thermography(g.ThermographyConfig(emissivity=98))
+cam.start(on_frame)
+print("Warming up... 5 seconds")
+time.sleep(5)
+
+# --- Wait for calibration ---
+print("Calibrating...")
+for attempt in range(20):
+    try:
+        s = cam.serial().query_temp_status(retries=2, wait_seconds=1.5)
+        if s:
+            last_status[0] = s
+            if last_frame[0] is not None:
+                linear_cal.fit(last_frame[0].y16, s)
+            print(f"Calibrated — "
+                  f"min:{s.min_c:.1f} max:{s.max_c:.1f}")
+            break
+    except:
+        pass
+    time.sleep(1)
+
+if not linear_cal.ready():
+    print("Calibration failed")
+    cam.stop()
+    sys.exit(1)
+
+print("Live view started. Press Q or Escape to quit.")
+cv2.namedWindow("Thermal Health Monitor", cv2.WINDOW_NORMAL)
+
+try:
+    while True:
+        # Refresh calibration
+        try:
+            s = cam.serial().query_temp_status(retries=1, wait_seconds=1.0)
+            if s:
+                last_status[0] = s
+                linear_cal.fit(last_frame[0].y16, s)
+        except:
+            pass
+
+        if last_frame[0] is None:
+            time.sleep(1)
+            continue
+
+        # --- Average 10 frames ---
+        all_temps = []
+        latest_frame = None
+        for _ in range(10):
+            if last_frame[0] is not None and linear_cal.ready():
+                all_temps.append(linear_cal.decode(last_frame[0].y16))
+                latest_frame = last_frame[0]
+            time.sleep(0.1)
+
+        if not all_temps or latest_frame is None:
+            continue
+
+        temps_avg = np.mean(all_temps, axis=0)
+        h, w = temps_avg.shape
+
+        # --- Prepare grayscale for T-FAKE ---
+        # Clip to body temp range — makes face bright, background dark
+        clip_min = 28.0
+        clip_max = 38.0
+        temps_clipped = np.clip(temps_avg, clip_min, clip_max)
+        gray = ((temps_clipped - clip_min) /
+                (clip_max - clip_min) * 255).astype(np.uint8)
+
+        # Resize to 224x224 for T-FAKE
+        gray_224 = cv2.resize(gray, (TFAKE_SIZE, TFAKE_SIZE))
+
+        # --- Run T-FAKE ---
+        try:
+            landmarks, confidences = landmarker.process(gray_224)
+            face_detected = (landmarks is not None and
+                             isinstance(landmarks, list) and
+                             len(landmarks) > 0)
+        except:
+            face_detected = False
+            landmarks = None
+
+        # --- Build display ---
+        palette = g.Palette.IronRed
+        opts    = g.PaletteOptions(auto_range=True)
+        rgb     = g.apply_palette(latest_frame.y16, palette, opts)
+        display = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+        display = cv2.resize(display, (w * 2, h * 2))
+
+        if face_detected:
+            lms   = np.array(landmarks[0],   dtype=np.float32)
+            confs = np.array(confidences[0], dtype=np.float32).flatten() \
+                    if isinstance(confidences, list) else \
+                    np.array(confidences, dtype=np.float32).flatten()
+
+            lms_scaled = scale_landmarks(lms, w, h)
+
+            lc_x = int(lms_scaled[LEFT_INNER_CANTHUS,  0])
+            lc_y = int(lms_scaled[LEFT_INNER_CANTHUS,  1])
+            rc_x = int(lms_scaled[RIGHT_INNER_CANTHUS, 0])
+            rc_y = int(lms_scaled[RIGHT_INNER_CANTHUS, 1])
+            ft_x = int(lms_scaled[FOREHEAD_TOP,         0])
+            ft_y = int(lms_scaled[FOREHEAD_TOP,         1])
+
+            lc_temp = get_region_temp(temps_avg, lc_x, lc_y, radius=3)
+            rc_temp = get_region_temp(temps_avg, rc_x, rc_y, radius=3)
+            ft_temp = get_region_temp(temps_avg, ft_x, ft_y, radius=5)
+
+            canthus_temp  = max(lc_temp, rc_temp)
+            combined_temp = (canthus_temp * 0.70) + (ft_temp * 0.30)
+            label, color  = classify(combined_temp)
+
+            # Store as last valid reading
+            last_valid_reading[0] = {
+                "lc_temp": lc_temp, "rc_temp": rc_temp,
+                "ft_temp": ft_temp, "combined": combined_temp,
+                "label": label, "color": color,
+                "lc_xy": (lc_x, lc_y), "rc_xy": (rc_x, rc_y),
+                "ft_xy": (ft_x, ft_y), "lms_scaled": lms_scaled,
+                "confs": confs
+            }
+            no_detect_count[0] = 0
+
+        elif last_valid_reading[0] is not None and \
+                no_detect_count[0] < MAX_NO_DETECT:
+            # Use last valid reading for a few frames
+            no_detect_count[0] += 1
+            r = last_valid_reading[0]
+            lc_temp = r["lc_temp"];  rc_temp = r["rc_temp"]
+            ft_temp = r["ft_temp"];  combined_temp = r["combined"]
+            label   = r["label"];    color = r["color"]
+            lc_x, lc_y = r["lc_xy"]
+            rc_x, rc_y = r["rc_xy"]
+            ft_x, ft_y = r["ft_xy"]
+            lms_scaled = r["lms_scaled"]
+            confs      = r["confs"]
+            face_detected = True  # treat as detected for display
+            print(f"Holding last reading ({no_detect_count[0]}/{MAX_NO_DETECT})")
+        else:
+            last_valid_reading[0] = None
+            no_detect_count[0]    = 0
+
+        if face_detected:
+            # Draw all landmarks
+            for i in range(478):
+                px = int(lms_scaled[i, 0]) * 2
+                py = int(lms_scaled[i, 1]) * 2
+                if 0 <= px < w*2 and 0 <= py < h*2:
+                    c = float(confs[i]) if i < len(confs) else 0.5
+                    if c > 0.01:
+                        cv2.circle(display, (px, py),
+                                   1, (100, 100, 255), -1)
+
+            cv2.circle(display, (lc_x*2, lc_y*2), 8, (0, 255, 255), 2)
+            cv2.circle(display, (rc_x*2, rc_y*2), 8, (0, 255, 255), 2)
+            cv2.putText(display, f"{lc_temp:.1f}C",
+                        (lc_x*2 + 8, lc_y*2 - 8),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.45, (0, 255, 255), 1)
+            cv2.putText(display, f"{rc_temp:.1f}C",
+                        (rc_x*2 + 8, rc_y*2 - 8),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.45, (0, 255, 255), 1)
+            cv2.circle(display, (ft_x*2, ft_y*2), 8, (0, 165, 255), 2)
+            cv2.putText(display, f"{ft_temp:.1f}C",
+                        (ft_x*2 + 8, ft_y*2 - 8),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.45, (0, 165, 255), 1)
+
+            cv2.putText(display, label,
+                        (20, 40),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 2)
+            cv2.putText(display,
+                        f"LC:{lc_temp:.1f} RC:{rc_temp:.1f} "
+                        f"FH:{ft_temp:.1f} Combined:{combined_temp:.1f}C",
+                        (20, 75),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 1)
+
+            print(f"LC:{lc_temp:.1f}C  RC:{rc_temp:.1f}C  "
+                  f"FH:{ft_temp:.1f}C  Combined:{combined_temp:.1f}C  "
+                  f"→ {label}")
+        else:
+            cv2.putText(display, "NO FACE DETECTED",
+                        (20, 40),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        1.0, (128, 128, 128), 2)
+            print("No face detected")
+
+        # Min/max bottom
+        if last_status[0] is not None:
+            cv2.putText(display,
+                        f"min:{last_status[0].min_c:.1f} "
+                        f"max:{last_status[0].max_c:.1f}",
+                        (20, h*2 - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.5, (200, 200, 200), 1)
+
+        cv2.imshow("Thermal Health Monitor", display)
+        key = cv2.waitKey(30) & 0xFF
+        if key == ord('q') or key == ord('Q') or key == 27:
+            print("Quitting...")
+            break
+
+except KeyboardInterrupt:
+    print("\nStopped.")
+finally:
+    cam.stop()
+    cv2.destroyAllWindows()
+    print("Stopped.")
