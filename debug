@@ -1,0 +1,29 @@
+nano ~/guideusb2_linux_sdk/debug_tfake.py
+
+PYTHONPATH=build/python python3 debug_tfake.py
+
+import sys
+sys.path.insert(0, 'build/python')
+import cv2
+import numpy as np
+from tfan import ThermalLandmarks
+
+landmarker = ThermalLandmarks(device="cpu", n_landmarks=478)
+
+# Create a dummy grayscale image to check output format
+dummy = np.zeros((288, 384), dtype=np.uint8)
+dummy[100:200, 150:250] = 180  # fake face-like warm region
+
+landmarks, confidences = landmarker.process(dummy)
+
+if landmarks is not None:
+    print(f"Landmarks shape: {landmarks.shape}")
+    print(f"Landmark 133 (L inner canthus): {landmarks[133]}")
+    print(f"Landmark 362 (R inner canthus): {landmarks[362]}")
+    print(f"Landmark 10  (forehead):        {landmarks[10]}")
+    print(f"Max landmark value: {landmarks.max()}")
+    print(f"Min landmark value: {landmarks.min()}")
+    print(f"Confidences shape: {confidences.shape}")
+    print(f"Confidence range: {confidences.min():.3f} to {confidences.max():.3f}")
+else:
+    print("No landmarks returned — need real face image")
