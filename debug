@@ -33,54 +33,108 @@ print("Ready.")
 cam = g.Camera(g.DeviceInfo(serial_port="/dev/ttyACM0"))
 cam.configure_thermography(g.ThermographyConfig(emissivity=98))
 cam.start(on_frame)
-print("Warming up...")
-time.sleep(3)
+print("Warming up... 5 seconds")
+time.sleep(5)
+
+# Keep retrying calibration until ready
+print("Waiting for calibration...")
+for attempt in range(20):
+    try:
+        s = cam.serial().query_temp_status(retries=2, wait_seconds=1.5)
+        if s:
+            last_status[0] = s
+            if last_frame[0] is not None:
+                linear_cal.fit(last_frame[0].y16, s)
+            print(f"Calibration ready — "
+                  f"min:{s.min_c:.1f} max:{s.max_c:.1f}")
+            break
+    except Exception as e:
+        print(f"Attempt {attempt+1} failed: {e}")
+    time.sleep(1)
+
+if not linear_cal.ready():
+    print("Calibration failed — exiting")
+    cam.stop()
+    sys.exit(1)
+
+# Now run detection loop
+print("Running detection — point sensor at face, press Ctrl+C to stop")
+print("-" * 60)
 
 try:
-    s = cam.serial().query_temp_status(retries=1, wait_seconds=1.0)
-    if s:
-        last_status[0] = s
-        if last_frame[0] is not None:
-            linear_cal.fit(last_frame[0].y16, s)
-except:
-    pass
+    while True:
+        # Refresh calibration
+        try:
+            s = cam.serial().query_temp_status(retries=1, wait_seconds=1.0)
+            if s:
+                last_status[0] = s
+                linear_cal.fit(last_frame[0].y16, s)
+        except:
+            pass
 
-time.sleep(2)
+        if last_frame[0] is None:
+            print("No frame yet...")
+            time.sleep(1)
+            continue
 
-if last_frame[0] is not None and linear_cal.ready():
-    temps  = linear_cal.decode(last_frame[0].y16)
-    h, w   = temps.shape
-    t_min  = float(temps.min())
-    t_max  = float(temps.max())
-    spread = t_max - t_min
+        temps  = linear_cal.decode(last_frame[0].y16)
+        h, w   = temps.shape
+        t_min  = float(temps.min())
+        t_max  = float(temps.max())
+        spread = t_max - t_min
 
-    if spread > 0:
-        gray = ((temps - t_min) / spread * 255).astype(np.uint8)
-    else:
-        gray = np.zeros((h, w), dtype=np.uint8)
+        # Clip to body temp range and normalise
+        # This makes face bright and background dark
+        clip_min = 28.0
+        clip_max = 38.0
+        temps_clipped = np.clip(temps, clip_min, clip_max)
+        gray = ((temps_clipped - clip_min) /
+                (clip_max - clip_min) * 255).astype(np.uint8)
 
-    landmarks, confidences = landmarker.process(gray)
+        # Run T-FAKE
+        landmarks, confidences = landmarker.process(gray)
 
-    print(f"Type of landmarks: {type(landmarks)}")
-    print(f"Type of confidences: {type(confidences)}")
+        if landmarks is not None:
+            lms   = np.array(landmarks,   dtype=np.float32)
+            confs = np.array(confidences, dtype=np.float32).flatten()
 
-    if landmarks is not None:
-        lms = np.array(landmarks)
-        print(f"lms shape: {lms.shape}")
-        print(f"lms dtype: {lms.dtype}")
-        print(f"lms[0]: {lms[0]}")
-        print(f"lms[0] type: {type(lms[0])}")
-        print(f"lms[0][0]: {lms[0][0]}")
-        print(f"lms[0][0] type: {type(lms[0][0])}")
-        print(f"First 5 landmarks:\n{lms[:5]}")
+            valid_mask  = (lms[:, 0] >= 0) & (lms[:, 1] >= 0)
+            valid_count = int(valid_mask.sum())
+            max_conf    = float(confs.max())
 
-        confs = np.array(confidences)
-        print(f"confs shape: {confs.shape}")
-        print(f"confs dtype: {confs.dtype}")
-        print(f"First 5 confs: {confs[:5]}")
+            print(f"spread:{spread:.1f}C  "
+                  f"valid:{valid_count}/478  "
+                  f"max_conf:{max_conf:.4f}")
 
-cam.stop()
-print("Done.")
+            # Print landmark format info once
+            if valid_count > 0:
+                first_valid = np.where(valid_mask)[0][0]
+                print(f"  landmark[{first_valid}] = "
+                      f"{lms[first_valid]}  "
+                      f"type:{type(lms[first_valid][0])}")
+
+                # Inner canthus temps
+                for idx, name in [(133, "L-canthus"),
+                                  (362, "R-canthus"),
+                                  (10,  "Forehead")]:
+                    if valid_mask[idx]:
+                        px = int(lms[idx, 0])
+                        py = int(lms[idx, 1])
+                        if 0 <= px < w and 0 <= py < h:
+                            t = float(temps[py, px])
+                            print(f"  {name}: "
+                                  f"pixel({px},{py}) "
+                                  f"temp:{t:.1f}C")
+        else:
+            print(f"spread:{spread:.1f}C  NO DETECTION")
+
+        time.sleep(2)
+
+except KeyboardInterrupt:
+    print("\nStopped.")
+finally:
+    cam.stop()
+    print("Done.")
 
 nano ~/guideusb2_linux_sdk/debug_live.py
 
