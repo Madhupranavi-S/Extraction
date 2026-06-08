@@ -1,5 +1,8 @@
 nano ~/guideusb2_linux_sdk/debug_live.py
 
+cd ~/guideusb2_linux_sdk
+sed -i 's/valid_mask = (lms\[:, 0\] >= 0) & (lms\[:, 1\] >= 0)/valid_mask = ((lms[:, 0] >= 0) \& (lms[:, 1] >= 0)).flatten()/' debug_live.py
+
 PYTHONPATH=build/python python3 debug_live.py
 
 import sys
