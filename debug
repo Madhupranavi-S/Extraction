@@ -1,3 +1,125 @@
+nano ~/guideusb2_linux_sdk/debug_live.py
+
+PYTHONPATH=build/python python3 debug_live.py
+
+import sys
+import time
+sys.path.insert(0, 'build/python')
+
+import guideusb2 as g
+import numpy as np
+import cv2
+from tfan import ThermalLandmarks
+
+linear_cal  = g.CameraLinearCal()
+last_status = [None]
+last_frame  = [None]
+
+def on_frame(frame):
+    last_frame[0] = frame
+    if last_status[0] is not None:
+        try:
+            linear_cal.fit(frame.y16, last_status[0])
+        except:
+            pass
+
+print("Loading T-FAKE...")
+landmarker = ThermalLandmarks(device="cpu", n_landmarks=478)
+print("Ready.")
+
+cam = g.Camera(g.DeviceInfo(serial_port="/dev/ttyACM0"))
+cam.configure_thermography(g.ThermographyConfig(emissivity=98))
+cam.start(on_frame)
+print("Warming up...")
+time.sleep(3)
+
+cv2.namedWindow("Debug", cv2.WINDOW_NORMAL)
+
+try:
+    while True:
+        try:
+            s = cam.serial().query_temp_status(retries=1, wait_seconds=1.0)
+            if s:
+                last_status[0] = s
+                if last_frame[0] is not None:
+                    linear_cal.fit(last_frame[0].y16, s)
+        except:
+            pass
+
+        if last_frame[0] is None or not linear_cal.ready():
+            time.sleep(1)
+            continue
+
+        temps = linear_cal.decode(last_frame[0].y16)
+        h, w  = temps.shape
+
+        # Normalise to grayscale
+        t_min = temps.min()
+        t_max = temps.max()
+        spread = t_max - t_min
+
+        print(f"Temp range: {t_min:.1f} - {t_max:.1f}  spread: {spread:.1f}C")
+
+        if spread > 0:
+            gray = ((temps - t_min) / spread * 255).astype(np.uint8)
+        else:
+            gray = np.zeros((h, w), dtype=np.uint8)
+
+        # Try landmark detection
+        landmarks, confidences = landmarker.process(gray)
+
+        # Show what the model sees
+        display = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+        display = cv2.resize(display, (w * 2, h * 2))
+
+        if landmarks is not None:
+            valid = [(i, lm) for i, lm in enumerate(landmarks)
+                     if lm[0] != -1 and lm[1] != -1]
+            print(f"Valid landmarks: {len(valid)}/478  "
+                  f"Max conf: {confidences.max():.3f}")
+
+            for i, lm in valid:
+                px, py = int(lm[0]) * 2, int(lm[1]) * 2
+                if 0 <= px < w*2 and 0 <= py < h*2:
+                    cv2.circle(display, (px, py), 2, (0, 255, 0), -1)
+
+            # Show inner canthus specifically
+            lc = landmarks[133]
+            rc = landmarks[362]
+            if lc[0] != -1:
+                cv2.circle(display, (lc[0]*2, lc[1]*2), 6, (0, 255, 255), 2)
+            if rc[0] != -1:
+                cv2.circle(display, (rc[0]*2, rc[1]*2), 6, (0, 255, 255), 2)
+
+            cv2.putText(display, f"Valid: {len(valid)}/478",
+                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.7, (0, 255, 0), 2)
+        else:
+            print("No landmarks returned")
+            cv2.putText(display, "NO DETECTION",
+                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.7, (0, 0, 255), 2)
+
+        # Also show grayscale value at centre
+        cy_c, cx_c = h//2, w//2
+        cv2.putText(display,
+                    f"spread:{spread:.1f}C  grey:{gray[cy_c,cx_c]}",
+                    (10, h*2 - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+
+        cv2.imshow("Debug", display)
+        key = cv2.waitKey(30) & 0xFF
+        if key == ord('q') or key == 27:
+            break
+
+except KeyboardInterrupt:
+    pass
+finally:
+    cam.stop()
+    cv2.destroyAllWindows()
+    print("Done.")
+
+
 nano ~/guideusb2_linux_sdk/debug_tfake.py
 
 PYTHONPATH=build/python python3 debug_tfake.py
