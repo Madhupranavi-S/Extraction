@@ -1,3 +1,7 @@
+cd ~/guideusb2_linux_sdk
+rm -rf thermal-canthus-detector
+git clone https://github.com/soibkhon/thermal-canthus-detector
+
 import sys
 import time
 import csv
