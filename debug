@@ -1,3 +1,11 @@
+for i in 0 1 2 3 4 5; do echo "Bus $i:"; sudo i2cdetect -y -r $i 2>/dev/null; done
+
+ls /dev/i2c*
+
+sudo i2cdetect -y -r 1
+sudo i2cdetect -y -r 7
+
+
 sudo systemctl enable ssh
 sudo systemctl start ssh
 sudo systemctl status ssh
