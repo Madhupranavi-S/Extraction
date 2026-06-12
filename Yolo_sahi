@@ -1,0 +1,603 @@
+nano ~/guideusb2_linux_sdk/yolo_sahi_classifier.py
+
+PYTHONPATH=build/python python3 yolo_sahi_classifier.py
+
+import sys
+import time
+import csv
+import os
+import argparse
+import threading
+from collections import deque
+from datetime import datetime
+from pathlib import Path
+
+sys.path.insert(0, 'build/python')
+
+import guideusb2 as g
+import numpy as np
+import cv2
+
+# =============================================================
+# LOCATE detect_canthus.py
+# =============================================================
+_REPO_CANDIDATES = [
+    Path(__file__).parent / "thermal-canthus-detector",
+    Path(__file__).parent,
+    Path.home() / "thermal-canthus-detector",
+]
+for _p in _REPO_CANDIDATES:
+    if (_p / "detect_canthus.py").exists():
+        sys.path.insert(0, str(_p))
+        break
+
+from detect_canthus import load_model  # noqa: E402
+
+# =============================================================
+# SAHI CONFIG
+# =============================================================
+SAHI_SLICE_H = 144
+SAHI_SLICE_W = 192
+SAHI_OVERLAP = 0.3
+
+def _clahe(img_bgr: np.ndarray) -> np.ndarray:
+    gray  = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    return cv2.cvtColor(clahe.apply(gray), cv2.COLOR_GRAY2RGB)
+
+def _sahi_detect(model, bgr: np.ndarray):
+    orig_h, orig_w = bgr.shape[:2]
+    stride_y = int(SAHI_SLICE_H * (1 - SAHI_OVERLAP))
+    stride_x = int(SAHI_SLICE_W * (1 - SAHI_OVERLAP))
+
+    best_conf  = -1.0
+    best_left  = None
+    best_right = None
+
+    y = 0
+    while y < orig_h:
+        y2 = min(y + SAHI_SLICE_H, orig_h)
+        y1 = max(0, y2 - SAHI_SLICE_H)
+        x = 0
+        while x < orig_w:
+            x2 = min(x + SAHI_SLICE_W, orig_w)
+            x1 = max(0, x2 - SAHI_SLICE_W)
+
+            patch      = bgr[y1:y2, x1:x2]
+            patch_prep = _clahe(patch)
+            results    = model(patch_prep, verbose=False)[0]
+
+            if results.keypoints is not None and len(results.keypoints) > 0:
+                idx  = int(results.boxes.conf.cpu().numpy().argmax())
+                conf = float(results.boxes.conf.cpu().numpy()[idx])
+                if conf > best_conf:
+                    kpts = results.keypoints.xy[idx].cpu().numpy()
+                    if kpts.shape[0] >= 2:
+                        lx = int(kpts[0, 0]) + x1
+                        ly = int(kpts[0, 1]) + y1
+                        rx = int(kpts[1, 0]) + x1
+                        ry = int(kpts[1, 1]) + y1
+                        best_left  = (lx, ly) if (kpts[0,0] > 0 or kpts[0,1] > 0) else None
+                        best_right = (rx, ry) if (kpts[1,0] > 0 or kpts[1,1] > 0) else None
+                        best_conf  = conf
+
+            x += stride_x
+            if x2 == orig_w:
+                break
+        y += stride_y
+        if y2 == orig_h:
+            break
+
+    return best_left, best_right
+
+# =============================================================
+# CONFIGURATION
+# =============================================================
+USE_BME280             = True
+BME280_PORT            = 7
+BME280_ADDRESS         = 0x76
+CALIB_AMBIENT          = 23.0
+EMISSIVITY             = 0.98
+MAX_NO_DETECT          = 3
+AUTO_SNAPSHOT_INTERVAL = 30
+SPIKE_GUARD_DELTA      = 3.0   # reject readings > this far from rolling avg
+ROLLING_WINDOW         = 5     # number of readings for rolling average
+LOG_FILE = os.path.expanduser("~/temperature_log.csv")
+SNAP_DIR = os.path.expanduser("~/snapshots")
+
+THRESH_NO_FACE    = 28.0
+THRESH_NORMAL     = 37.1
+THRESH_LOW_FEVER  = 37.5
+THRESH_HIGH_FEVER = 39.0
+
+# =============================================================
+# AMBIENT COMPENSATION
+# =============================================================
+def compensate(t_raw, t_ambient):
+    return t_raw - (1.0 - EMISSIVITY) * (t_ambient - CALIB_AMBIENT)
+
+def get_ambient():
+    if USE_BME280:
+        try:
+            import smbus2, bme280
+            bus    = smbus2.SMBus(BME280_PORT)
+            params = bme280.load_calibration_params(bus, BME280_ADDRESS)
+            data   = bme280.sample(bus, BME280_ADDRESS, params)
+            return data.temperature, data.humidity
+        except Exception as e:
+            print(f"BME280 read failed: {e} — using fallback")
+    if last_status[0] is not None:
+        return last_status[0].min_c, None
+    return CALIB_AMBIENT, None
+
+# =============================================================
+# CLASSIFICATION
+# =============================================================
+def classify(temp_c):
+    if temp_c < THRESH_NO_FACE:
+        return "NO FACE",    (128, 128, 128)
+    elif temp_c < THRESH_NORMAL:
+        return "NORMAL",     (0, 255, 0)
+    elif temp_c < THRESH_LOW_FEVER:
+        return "LOW FEVER",  (0, 165, 255)
+    elif temp_c < THRESH_HIGH_FEVER:
+        return "HIGH FEVER", (0, 0, 255)
+    else:
+        return "EMERGENCY",  (0, 0, 180)
+
+def get_region_temp(temps, px, py, radius=3):
+    h, w = temps.shape
+    x1 = max(0, px - radius);  x2 = min(w, px + radius)
+    y1 = max(0, py - radius);  y2 = min(h, py + radius)
+    region = temps[y1:y2, x1:x2]
+    return float(np.max(region)) if region.size > 0 else 0.0
+
+# =============================================================
+# SPIKE GUARD — rolling average filter
+# =============================================================
+_rolling_temps = deque(maxlen=ROLLING_WINDOW)
+
+def spike_guard(new_temp: float) -> bool:
+    """
+    Returns True if reading is valid (not a spike).
+    Rejects if it deviates more than SPIKE_GUARD_DELTA from rolling avg.
+    Always accepts if we have fewer than 3 readings (building baseline).
+    """
+    if len(_rolling_temps) < 3:
+        _rolling_temps.append(new_temp)
+        return True
+    avg = float(np.mean(_rolling_temps))
+    if abs(new_temp - avg) > SPIKE_GUARD_DELTA:
+        print(f"  [spike guard] rejected {new_temp:.1f}C "
+              f"(avg {avg:.1f}C, delta {abs(new_temp-avg):.1f}C)")
+        return False
+    _rolling_temps.append(new_temp)
+    return True
+
+# =============================================================
+# BACKGROUND DETECTION THREAD
+# Runs SAHI detection continuously without blocking the display.
+# =============================================================
+class DetectionThread(threading.Thread):
+    def __init__(self, model):
+        super().__init__(daemon=True)
+        self.model   = model
+        self._lock   = threading.Lock()
+        self._bgr    = None          # latest frame to process
+        self._result = (None, None)  # latest (left_pt, right_pt)
+        self._running = True
+
+    def submit(self, bgr: np.ndarray):
+        """Main thread calls this to hand a new frame for detection."""
+        with self._lock:
+            self._bgr = bgr.copy()
+
+    def get_result(self):
+        """Main thread calls this to read the latest detection result."""
+        with self._lock:
+            return self._result
+
+    def run(self):
+        while self._running:
+            with self._lock:
+                bgr = self._bgr
+                self._bgr = None          # consume
+            if bgr is None:
+                time.sleep(0.02)          # nothing to do yet
+                continue
+            try:
+                left_pt, right_pt = _sahi_detect(self.model, bgr)
+                with self._lock:
+                    self._result = (left_pt, right_pt)
+            except Exception as e:
+                print(f"Detection thread error: {e}")
+
+    def stop(self):
+        self._running = False
+
+# =============================================================
+# LOGGING
+# =============================================================
+def init_log():
+    os.makedirs(SNAP_DIR, exist_ok=True)
+    if not os.path.exists(LOG_FILE):
+        with open(LOG_FILE, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                "timestamp", "lc_raw", "rc_raw",
+                "canthus_raw", "t_ambient", "humidity",
+                "lc_corrected", "rc_corrected",
+                "canthus_corrected", "ambient_source",
+                "classification", "holding"
+            ])
+
+def log_reading(lc_raw, rc_raw,
+                t_amb, humidity,
+                lc_corr, rc_corr,
+                label, ambient_source, holding):
+    canthus_raw  = max(lc_raw,  rc_raw)
+    canthus_corr = max(lc_corr, rc_corr)
+    with open(LOG_FILE, 'a', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            f"{lc_raw:.2f}",      f"{rc_raw:.2f}",
+            f"{canthus_raw:.2f}", f"{t_amb:.2f}",
+            f"{humidity:.1f}" if humidity else "N/A",
+            f"{lc_corr:.2f}",     f"{rc_corr:.2f}",
+            f"{canthus_corr:.2f}", ambient_source,
+            label, "yes" if holding else "no"
+        ])
+
+# =============================================================
+# DEBUG DISPLAY BUILDER
+# =============================================================
+def build_debug_display(latest_frame, temps_avg, bgr_input,
+                        face_detected, holding,
+                        lc_raw, rc_raw,
+                        lc_corr, rc_corr,
+                        t_amb, humidity,
+                        label, color,
+                        lc_xy, rc_xy,
+                        ambient_source):
+    h, w = temps_avg.shape
+
+    # Panel 1 — IronRed thermal
+    palette = g.Palette.IronRed
+    opts    = g.PaletteOptions(auto_range=True)
+    rgb     = g.apply_palette(latest_frame.y16, palette, opts)
+    panel1  = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+    panel1  = cv2.resize(panel1, (w * 2, h * 2))
+
+    # Panel 2 — BGR fed to YOLO
+    panel2 = cv2.resize(bgr_input, (w * 2, h * 2))
+    cv2.putText(panel2, "YOLO+SAHI input",
+                (10, 25), cv2.FONT_HERSHEY_SIMPLEX,
+                0.5, (200, 200, 200), 1)
+
+    if face_detected:
+        lc_x, lc_y = lc_xy
+        rc_x, rc_y = rc_xy
+        for panel in (panel1, panel2):
+            for (cx, cy, t_r, t_c, lbl) in [
+                (lc_x, lc_y, lc_raw, lc_corr, "LC"),
+                (rc_x, rc_y, rc_raw, rc_corr, "RC"),
+            ]:
+                cv2.circle(panel, (cx*2, cy*2), 8, (0, 255, 255), 2)
+                cv2.putText(panel,
+                            f"{lbl} r:{t_r:.1f} c:{t_c:.1f}",
+                            (cx*2 + 8, cy*2 - 8),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.4, (0, 255, 255), 1)
+            cv2.line(panel,
+                     (lc_x*2, lc_y*2), (rc_x*2, rc_y*2),
+                     (0, 255, 255), 1)
+
+        # --- HOLDING indicator on panel1 ---
+        if holding:
+            cv2.putText(panel1,
+                        "HOLDING PREV READING",
+                        (10, h*2 - 40),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.55, (0, 200, 255), 2)
+    else:
+        cv2.putText(panel1, "NO FACE DETECTED",
+                    (20, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    1.0, (128, 128, 128), 2)
+
+    # Status bar
+    bar_h = 90
+    bar   = np.zeros((bar_h, w * 4, 3), dtype=np.uint8)
+
+    canthus_raw  = max(lc_raw,  rc_raw)
+    canthus_corr = max(lc_corr, rc_corr)
+
+    # Build display label — append (holding) if holding
+    display_label = f"{label} (holding)" if holding else label
+
+    hum_str  = f"{humidity:.0f}%" if humidity else "N/A"
+    src_icon = "BME280" if USE_BME280 else "fallback"
+    amb_str  = (f"Ambient: {t_amb:.1f}C  "
+                f"RH: {hum_str}  [{src_icon}]  "
+                f"{datetime.now().strftime('%H:%M:%S')}")
+    raw_str  = (f"RAW  LC:{lc_raw:.1f}  RC:{rc_raw:.1f}  "
+                f"Canthus:{canthus_raw:.1f}C")
+    cor_str  = (f"CORR LC:{lc_corr:.1f}  RC:{rc_corr:.1f}  "
+                f"Canthus:{canthus_corr:.1f}C")
+
+    cv2.putText(bar, amb_str,
+                (10, 22), cv2.FONT_HERSHEY_SIMPLEX,
+                0.55, (200, 200, 0), 1)
+    cv2.putText(bar, raw_str,
+                (10, 48), cv2.FONT_HERSHEY_SIMPLEX,
+                0.5, (180, 180, 180), 1)
+    cv2.putText(bar, cor_str,
+                (10, 72), cv2.FONT_HERSHEY_SIMPLEX,
+                0.5, color, 1)
+
+    # Display label with (holding) if applicable — right side of bar
+    cv2.putText(bar, display_label,
+                (w * 4 - 380, 62),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1.0, color, 2)
+
+    top     = np.hstack([panel1, panel2])
+    display = np.vstack([top, bar])
+    return display, canthus_corr
+
+# =============================================================
+# CAMERA STATE
+# =============================================================
+linear_cal      = g.CameraLinearCal()
+last_status     = [None]
+last_frame      = [None]
+last_valid      = [None]
+no_detect_count = [0]
+snapshot_count  = [0]
+last_snap_time  = [time.time()]
+
+def on_frame(frame):
+    last_frame[0] = frame
+    if last_status[0] is not None:
+        try:
+            linear_cal.fit(frame.y16, last_status[0])
+        except Exception:
+            pass
+
+# =============================================================
+# MAIN
+# =============================================================
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--weights", default=None)
+    ap.add_argument("--port", default="/dev/ttyACM0")
+    args = ap.parse_args()
+
+    if args.weights:
+        weights_path = Path(args.weights)
+    else:
+        candidates = [
+            Path(__file__).parent / "thermal-canthus-detector" / "thermal_canthus_yolo.pt",
+            Path(__file__).parent / "thermal_canthus_yolo.pt",
+            Path.home() / "thermal-canthus-detector" / "thermal_canthus_yolo.pt",
+        ]
+        weights_path = next((p for p in candidates if p.exists()), candidates[0])
+
+    print(f"Loading YOLO canthus model: {weights_path}")
+    model = load_model(weights_path)
+    print("Model ready.")
+
+    # Start background detection thread
+    det_thread = DetectionThread(model)
+    det_thread.start()
+    print("Background detection thread started.")
+
+    init_log()
+    print(f"Logging to:   {LOG_FILE}")
+    print(f"Snapshots to: {SNAP_DIR}")
+
+    cam = g.Camera(g.DeviceInfo(serial_port=args.port))
+    cam.configure_thermography(g.ThermographyConfig(emissivity=98))
+    cam.start(on_frame)
+    print("Warming up... 5 seconds")
+    time.sleep(5)
+
+    print("Calibrating...")
+    for _ in range(20):
+        try:
+            s = cam.serial().query_temp_status(retries=2, wait_seconds=1.5)
+            if s:
+                last_status[0] = s
+                if last_frame[0] is not None:
+                    linear_cal.fit(last_frame[0].y16, s)
+                print(f"Calibrated — min:{s.min_c:.1f}  max:{s.max_c:.1f}")
+                break
+        except Exception:
+            pass
+        time.sleep(1)
+
+    if not linear_cal.ready():
+        print("Calibration failed.")
+        cam.stop()
+        det_thread.stop()
+        sys.exit(1)
+
+    print("Live view started.")
+    print("Q/Escape = quit  |  S = manual snapshot")
+    cv2.namedWindow("Thermal Health Monitor", cv2.WINDOW_NORMAL)
+
+    try:
+        while True:
+            # Refresh calibration
+            try:
+                s = cam.serial().query_temp_status(retries=1, wait_seconds=1.0)
+                if s and last_frame[0] is not None:
+                    last_status[0] = s
+                    linear_cal.fit(last_frame[0].y16, s)
+            except Exception:
+                pass
+
+            if last_frame[0] is None or not linear_cal.ready():
+                time.sleep(0.05)
+                continue
+
+            # Average 10 frames
+            all_temps    = []
+            latest_frame = None
+            for _ in range(10):
+                if last_frame[0] is not None and linear_cal.ready():
+                    all_temps.append(linear_cal.decode(last_frame[0].y16))
+                    latest_frame = last_frame[0]
+                time.sleep(0.1)
+
+            if not all_temps or latest_frame is None:
+                continue
+
+            temps_avg = np.mean(all_temps, axis=0)
+            h, w      = temps_avg.shape
+
+            # Ambient
+            t_amb, humidity = get_ambient()
+            ambient_source  = "BME280" if USE_BME280 else "min_c fallback"
+
+            # BGR for YOLO — submit to background thread
+            palette = g.Palette.IronRed
+            opts    = g.PaletteOptions(auto_range=True)
+            rgb     = g.apply_palette(latest_frame.y16, palette, opts)
+            bgr     = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+            det_thread.submit(bgr)
+
+            # Get latest result from background thread
+            # (may be from a slightly earlier frame — acceptable)
+            left_pt, right_pt = det_thread.get_result()
+            face_detected = (left_pt is not None) or (right_pt is not None)
+
+            holding = False
+
+            if face_detected:
+                lc_x, lc_y = left_pt  if left_pt  is not None else (0, 0)
+                rc_x, rc_y = right_pt if right_pt is not None else (0, 0)
+
+                lc_raw = get_region_temp(temps_avg, lc_x, lc_y, radius=3) \
+                         if left_pt  is not None else 0.0
+                rc_raw = get_region_temp(temps_avg, rc_x, rc_y, radius=3) \
+                         if right_pt is not None else 0.0
+
+                canthus_raw = max(lc_raw, rc_raw)
+
+                # --- Spike guard ---
+                if not spike_guard(canthus_raw):
+                    # Spike detected — hold last valid reading
+                    if last_valid[0] is not None:
+                        r       = last_valid[0]
+                        lc_raw  = r["lc_raw"];  rc_raw  = r["rc_raw"]
+                        lc_corr = r["lc_corr"]; rc_corr = r["rc_corr"]
+                        label   = r["label"];   color   = r["color"]
+                        lc_xy   = r["lc_xy"];   rc_xy   = r["rc_xy"]
+                        holding = True
+                        print(f"  [spike guard] holding: "
+                              f"LC:{lc_raw:.1f} RC:{rc_raw:.1f}")
+                    else:
+                        face_detected = False
+                else:
+                    lc_corr = compensate(lc_raw, t_amb)
+                    rc_corr = compensate(rc_raw, t_amb)
+                    canthus_corr = max(lc_corr, rc_corr)
+                    label, color = classify(canthus_corr)
+
+                    last_valid[0] = {
+                        "lc_raw":  lc_raw,   "rc_raw":  rc_raw,
+                        "lc_corr": lc_corr,  "rc_corr": rc_corr,
+                        "label":   label,    "color":   color,
+                        "lc_xy":   (lc_x, lc_y),
+                        "rc_xy":   (rc_x, rc_y),
+                    }
+                    no_detect_count[0] = 0
+                    lc_xy = (lc_x, lc_y)
+                    rc_xy = (rc_x, rc_y)
+
+                log_reading(lc_raw, rc_raw,
+                            t_amb, humidity,
+                            lc_corr, rc_corr,
+                            label, ambient_source, holding)
+
+                rh_str = f"{humidity:.0f}%" if humidity else "N/A"
+                hold_str = " [holding]" if holding else ""
+                print(f"[{datetime.now().strftime('%H:%M:%S')}]  "
+                      f"Amb:{t_amb:.1f}C RH:{rh_str}  "
+                      f"RAW LC:{lc_raw:.1f} RC:{rc_raw:.1f}  "
+                      f"CORR LC:{lc_corr:.1f} RC:{rc_corr:.1f}  "
+                      f"-> {label}{hold_str}")
+
+            elif last_valid[0] is not None \
+                    and no_detect_count[0] < MAX_NO_DETECT:
+                no_detect_count[0] += 1
+                r       = last_valid[0]
+                lc_raw  = r["lc_raw"];  rc_raw  = r["rc_raw"]
+                lc_corr = r["lc_corr"]; rc_corr = r["rc_corr"]
+                label   = r["label"];   color   = r["color"]
+                lc_xy   = r["lc_xy"];   rc_xy   = r["rc_xy"]
+                face_detected = True
+                holding = True
+                print(f"Holding last reading "
+                      f"({no_detect_count[0]}/{MAX_NO_DETECT})")
+            else:
+                last_valid[0]      = None
+                no_detect_count[0] = 0
+                lc_raw = rc_raw = lc_corr = rc_corr = 0.0
+                label, color = "NO FACE", (128, 128, 128)
+                lc_xy = rc_xy = (0, 0)
+                holding = False
+                print("No face detected")
+
+            # Build display
+            display, _ = build_debug_display(
+                latest_frame, temps_avg, bgr,
+                face_detected, holding,
+                lc_raw, rc_raw,
+                lc_corr, rc_corr,
+                t_amb, humidity,
+                label, color,
+                lc_xy, rc_xy,
+                ambient_source)
+
+            cv2.imshow("Thermal Health Monitor", display)
+            key = cv2.waitKey(30) & 0xFF
+
+            if key in (ord('q'), ord('Q'), 27):
+                print("Quitting...")
+                break
+            elif key in (ord('s'), ord('S')):
+                snapshot_count[0] += 1
+                fname = os.path.join(
+                    SNAP_DIR,
+                    f"snap_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                    f"_{snapshot_count[0]:03d}.png")
+                cv2.imwrite(fname, display)
+                print(f"Manual snapshot: {fname}")
+
+            now = time.time()
+            if now - last_snap_time[0] >= AUTO_SNAPSHOT_INTERVAL:
+                last_snap_time[0] = now
+                snapshot_count[0] += 1
+                fname = os.path.join(
+                    SNAP_DIR,
+                    f"snap_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                    f"_auto_{snapshot_count[0]:03d}.png")
+                cv2.imwrite(fname, display)
+                print(f"Auto snapshot: {fname}")
+
+    except KeyboardInterrupt:
+        print("\nStopped.")
+    finally:
+        det_thread.stop()
+        cam.stop()
+        cv2.destroyAllWindows()
+        print(f"Log:       {LOG_FILE}")
+        print(f"Snapshots: {SNAP_DIR}")
+        print("Stopped.")
+
+
+if __name__ == "__main__":
+    main()
