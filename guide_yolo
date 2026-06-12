@@ -1,3 +1,6 @@
+pip install "numpy<2" --force-reinstall
+pip install "opencv-python==4.8.1.78" --force-reinstall
+
 cd ~/guideusb2_linux_sdk
 
 nano ~/guideusb2_linux_sdk/yolo_s.py
@@ -42,6 +45,13 @@ from detect_canthus import load_model  # noqa: E402
 SAHI_SLICE_H   = 144   # patch height  (half of 288)
 SAHI_SLICE_W   = 192   # patch width   (half of 384)
 SAHI_OVERLAP   = 0.3   # 30 % overlap between adjacent patches
+
+# Speed control:
+# Full SAHI (all patches) runs every N loops. In between, only the single
+# patch around the last known canthus position is checked — this is fast
+# (1 YOLO call instead of ~9) and keeps the reading responsive.
+# Increase SAHI_EVERY_N to go faster; decrease for more robustness.
+SAHI_EVERY_N   = 5     # run full SAHI every 5 loops (~1 s at current speed)
 
 def _clahe(img_bgr: np.ndarray) -> np.ndarray:
     """Replicate detect_canthus internal preprocessing."""
@@ -107,6 +117,50 @@ def _sahi_detect(model, bgr: np.ndarray):
             break
 
     return best_left, best_right
+
+
+def _fast_detect(model, bgr: np.ndarray,
+                 last_left, last_right):
+    """
+    Fast path: only run YOLO on the region around the last known canthus
+    positions. One YOLO call instead of ~9. Used on frames between full
+    SAHI runs to keep display responsive.
+    Returns (left_pt, right_pt) in full-frame coords.
+    """
+    orig_h, orig_w = bgr.shape[:2]
+
+    # Build a crop that contains both last known points + generous margin
+    margin = max(SAHI_SLICE_H, SAHI_SLICE_W) // 2
+
+    pts = [p for p in (last_left, last_right) if p is not None]
+    if not pts:
+        # No prior location — fall back to full SAHI
+        return _sahi_detect(model, bgr)
+
+    xs = [p[0] for p in pts]
+    ys = [p[1] for p in pts]
+    x1 = max(0,      min(xs) - margin)
+    x2 = min(orig_w, max(xs) + margin)
+    y1 = max(0,      min(ys) - margin)
+    y2 = min(orig_h, max(ys) + margin)
+
+    patch      = bgr[y1:y2, x1:x2]
+    patch_prep = _clahe(patch)
+    results    = model(patch_prep, verbose=False)[0]
+
+    if results.keypoints is None or len(results.keypoints) == 0:
+        return None, None
+
+    idx  = int(results.boxes.conf.cpu().numpy().argmax())
+    kpts = results.keypoints.xy[idx].cpu().numpy()
+    if kpts.shape[0] < 2:
+        return None, None
+
+    left_out  = (int(kpts[0,0]) + x1, int(kpts[0,1]) + y1) \
+                if (kpts[0,0] > 0 or kpts[0,1] > 0) else None
+    right_out = (int(kpts[1,0]) + x1, int(kpts[1,1]) + y1) \
+                if (kpts[1,0] > 0 or kpts[1,1] > 0) else None
+    return left_out, right_out
 
 # =============================================================
 # CONFIGURATION
@@ -298,6 +352,7 @@ last_valid      = [None]
 no_detect_count = [0]
 snapshot_count  = [0]
 last_snap_time  = [time.time()]
+sahi_loop_count = [0]   # counts loops; full SAHI runs every SAHI_EVERY_N
 
 def on_frame(frame):
     last_frame[0] = frame
@@ -411,14 +466,24 @@ def main():
             rgb     = g.apply_palette(latest_frame.y16, palette, opts)
             bgr     = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
 
-            # --- Run SAHI sliced canthus detection ---
+            # --- Run detection: full SAHI every N loops, fast patch in between ---
+            sahi_loop_count[0] += 1
+            use_full_sahi = (sahi_loop_count[0] % SAHI_EVERY_N == 1)
             try:
-                left_pt, right_pt = _sahi_detect(model, bgr)
+                if use_full_sahi or last_valid[0] is None:
+                    left_pt, right_pt = _sahi_detect(model, bgr)
+                    mode = "SAHI"
+                else:
+                    prev_l = last_valid[0].get("lc_xy")
+                    prev_r = last_valid[0].get("rc_xy")
+                    left_pt, right_pt = _fast_detect(model, bgr, prev_l, prev_r)
+                    mode = "fast"
                 face_detected = (left_pt is not None) or (right_pt is not None)
             except Exception as exc:
                 print(f"Detection error: {exc}")
                 face_detected = False
                 left_pt = right_pt = None
+                mode = "err"
 
             # --- Process detections ---
             if face_detected:
@@ -455,7 +520,7 @@ def main():
                       f"Amb:{t_amb:.1f}C  RH:{rh_str}  "
                       f"RAW LC:{lc_raw:.1f} RC:{rc_raw:.1f}  "
                       f"CORR LC:{lc_corr:.1f} RC:{rc_corr:.1f}  "
-                      f"-> {label}")
+                      f"-> {label}  [{mode}]")
 
             elif last_valid[0] is not None and no_detect_count[0] < MAX_NO_DETECT:
                 no_detect_count[0] += 1
