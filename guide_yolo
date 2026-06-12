@@ -1,5 +1,6 @@
-pip install "numpy<2" --force-reinstall
-pip install "opencv-python==4.8.1.78" --force-reinstall
+pip uninstall opencv-python opencv-python-headless numpy sahi -y
+
+pip install "numpy<2" "opencv-python<4.10" sahi ultralytics
 
 cd ~/guideusb2_linux_sdk
 
