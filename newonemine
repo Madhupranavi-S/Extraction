@@ -1,5 +1,3 @@
-PYTHONPATH=build/python python3 single_stage_canthus.py --weights best.pt
-
 nano ~/guideusb2_linux_sdk/single_stage_canthus.py
 
 PYTHONPATH=build/python python3 single_stage_canthus.py
@@ -326,6 +324,10 @@ def build_debug_display(frozen_frame, temps_avg, bgr_input,
     if face_detected:
         lc_x, lc_y = lc_xy
         rc_x, rc_y = rc_xy
+        lc_x = int(lc_x) if lc_x is not None else None
+        lc_y = int(lc_y) if lc_y is not None else None
+        rc_x = int(rc_x) if rc_x is not None else None
+        rc_y = int(rc_y) if rc_y is not None else None
 
         for panel in (panel1, panel2):
             if lc_x is not None:
@@ -465,9 +467,9 @@ def main():
         weights_path = Path(args.weights)
     else:
         candidates = [
-            Path(__file__).parent / "thermal-canthus" / "best.pt",
+            Path(__file__).parent / "thermal-canthus-detector" / "best.pt",
             Path(__file__).parent / "best.pt",
-            Path.home() / "thermal-canthus" / "best.pt",
+            Path.home() / "thermal-canthus-detector" / "best.pt",
         ]
         weights_path = next(
             (p for p in candidates if p.exists()), candidates[0])
