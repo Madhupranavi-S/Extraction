@@ -32,7 +32,7 @@ def _preprocess(img_bgr: np.ndarray) -> np.ndarray:
     Match training pipeline.
     Training used IronRed images directly.
     """
-    return cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+    return img_bgr
 
 def _single_stage_detect(model, bgr: np.ndarray):
     """
