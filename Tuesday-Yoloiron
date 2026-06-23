@@ -464,9 +464,9 @@ def main():
         weights_path = Path(args.weights)
     else:
         candidates = [
-            Path(__file__).parent / "thermal-canthus-detector" / "best.pt",
-            Path(__file__).parent / "best.pt",
-            Path.home() / "thermal-canthus-detector" / "best.pt",
+            Path(__file__).parent / "thermal-canthus-detector" / "detect.pt",
+            Path(__file__).parent / "detect.pt",
+            Path.home() / "thermal-canthus-detector" / "detect.pt",
         ]
         weights_path = next(
             (p for p in candidates if p.exists()), candidates[0])
