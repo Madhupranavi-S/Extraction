@@ -1,3 +1,29 @@
+jetson@jetson-desktop:~/guideusb2_linux_sdk$ PYTHONPATH=build/python python3 pyolo_sahi.py
+Loading YOLO canthus model: /home/jetson/guideusb2_linux_sdk/thermal-canthus-detector/thermal_canthus_yolo.pt
+Model ready.
+Logging to:   /home/jetson/temperature_log.csv
+Snapshots to: /home/jetson/snapshots
+Warming up... 5 seconds
+Calibrating...
+Calibrated — min:19.5  max:35.9
+Live view started.
+Q/Escape = quit  |  S = manual snapshot
+  [stability] warming up 2.0s...
+  [stability] scene stable (spread 0.00C)
+/home/jetson/.local/lib/python3.10/site-packages/torch/cuda/__init__.py:187: UserWarning: CUDA initialization: The NVIDIA driver on your system is too old (found version 12060). Please update your GPU driver by downloading and installing a new version from the URL: http://www.nvidia.com/Download/index.aspx Alternatively, go to: https://pytorch.org to install a PyTorch version that has been compiled with your version of the CUDA driver. (Triggered internally at /pytorch/c10/cuda/CUDAFunctions.cpp:119.)
+  return torch._C._cuda_getDeviceCount() > 0
+  [symmetry] rejected — LC:33.0 RC:35.6 diff:2.6C > 1.5C
+Log:       /home/jetson/temperature_log.csv
+Snapshots: /home/jetson/snapshots
+Stopped.
+Traceback (most recent call last):
+  File "/home/jetson/guideusb2_linux_sdk/pyolo_sahi.py", line 703, in <module>
+    main()
+  File "/home/jetson/guideusb2_linux_sdk/pyolo_sahi.py", line 661, in main
+    label, color,
+UnboundLocalError: local variable 'label' referenced before assignment
+jetson@jetson-desktop:~/guideusb2_linux_sdk$ 
+
 import sys
 import time
 import csv
