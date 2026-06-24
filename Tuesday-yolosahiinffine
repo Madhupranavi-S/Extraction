@@ -178,8 +178,12 @@ def _single_stage_detect(model, bgr: np.ndarray):
         else:
             patch_in = patch
 
-        results = model(patch_in, imgsz=IMG_SIZE, conf=CONF_THRESH,
-                         verbose=False)[0]
+        results = model(patch_in, imgsz=IMG_SIZE, conf=0.01, verbose=False)[0]
+
+        if results.boxes is not None and len(results.boxes) > 0:
+            print(f"slice ({x1},{y1})-({x2},{y2}): "
+                  f"max_conf={results.boxes.conf.max():.3f}, "
+                  f"cls={results.boxes.cls.cpu().numpy().astype(int).tolist()}")
 
         if results.boxes is None or len(results.boxes) == 0:
             continue
