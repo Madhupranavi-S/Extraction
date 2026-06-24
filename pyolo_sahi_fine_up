@@ -1,0 +1,907 @@
+import sys
+import time
+import csv
+import os
+import argparse
+from collections import deque
+from datetime import datetime
+from pathlib import Path
+
+sys.path.insert(0, 'build/python')
+
+import guideusb2 as g
+import numpy as np
+import cv2
+from ultralytics import YOLO
+
+# =============================================================
+# SINGLE-STAGE MODEL CONFIG
+# =============================================================
+# best.pt was TRAINED on SAHI-sliced crops. At inference time we
+# now ALSO slice the full frame with SAHI (same slice geometry the
+# model was trained on) instead of running it on the whole frame.
+# It detects two classes directly:
+#   0 -> left_inner_canthus
+#   1 -> right_inner_canthus
+CLASS_LEFT  = 0
+CLASS_RIGHT = 1
+CONF_THRESH = 0.25
+IMG_SIZE    = 320   # imgsz fed to the model per-slice
+
+# --- SAHI slicing geometry ---
+# Tuned for subjects at ~2-3m on a typical handheld thermal camera
+# (canthus is only a handful of pixels wide in the full frame at this
+# range, so slices need to be small enough that the canthus occupies
+# a meaningful fraction of each tile — see SAHI_UPSCALE below too).
+# If best.pt was trained on a specific crop size, prefer that instead
+# (override via --slice-w/--slice-h).
+SAHI_SLICE_H = 72
+SAHI_SLICE_W = 96
+SAHI_OVERLAP = 0.35         # fractional overlap between adjacent slices
+                            # (higher than usual so a canthus sitting
+                            # near a tile border is fully captured in
+                            # at least one neighbouring slice)
+SAHI_MERGE_IOU = 0.3        # IoU threshold for de-duplicating boxes
+                            # that straddle two overlapping slices
+SAHI_UPSCALE = 2.0          # each slice is upscaled by this factor
+                            # before inference, recovering effective
+                            # resolution for small/far targets without
+                            # needing impractically tiny slices
+
+
+def _preprocess(img_bgr: np.ndarray) -> np.ndarray:
+    """
+    Match training pipeline.
+    Training used IronRed images directly — no CLAHE, no extra
+    contrast steps. Keep this identical for every slice we feed
+    the model so inference matches training distribution.
+    """
+    return img_bgr
+
+
+def _make_slices(width: int, height: int):
+    """
+    Generate (x1, y1, x2, y2) slice boxes covering the full frame,
+    with overlap, clamped to the frame edges. Mirrors how the
+    training crops were generated (last slice in each axis is
+    pulled back from the far edge rather than running off frame).
+    """
+    stride_x = max(1, int(SAHI_SLICE_W * (1 - SAHI_OVERLAP)))
+    stride_y = max(1, int(SAHI_SLICE_H * (1 - SAHI_OVERLAP)))
+
+    xs = list(range(0, max(width - SAHI_SLICE_W, 0) + 1, stride_x))
+    ys = list(range(0, max(height - SAHI_SLICE_H, 0) + 1, stride_y))
+    if not xs or xs[-1] != max(width - SAHI_SLICE_W, 0):
+        xs.append(max(width - SAHI_SLICE_W, 0))
+    if not ys or ys[-1] != max(height - SAHI_SLICE_H, 0):
+        ys.append(max(height - SAHI_SLICE_H, 0))
+
+    slices = []
+    for y1 in ys:
+        y2 = min(y1 + SAHI_SLICE_H, height)
+        y1 = max(0, y2 - SAHI_SLICE_H)
+        for x1 in xs:
+            x2 = min(x1 + SAHI_SLICE_W, width)
+            x1 = max(0, x2 - SAHI_SLICE_W)
+            slices.append((x1, y1, x2, y2))
+    return slices
+
+
+def _iou(box_a, box_b) -> float:
+    ax1, ay1, ax2, ay2 = box_a
+    bx1, by1, bx2, by2 = box_b
+
+    inter_x1 = max(ax1, bx1)
+    inter_y1 = max(ay1, by1)
+    inter_x2 = min(ax2, bx2)
+    inter_y2 = min(ay2, by2)
+
+    inter_w = max(0.0, inter_x2 - inter_x1)
+    inter_h = max(0.0, inter_y2 - inter_y1)
+    inter_area = inter_w * inter_h
+    if inter_area <= 0:
+        return 0.0
+
+    area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+    area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+    union = area_a + area_b - inter_area
+    if union <= 0:
+        return 0.0
+    return inter_area / union
+
+
+def _nms_merge(dets):
+    """
+    Greedy NMS over a list of (box_xyxy, conf) for a single class.
+    Slices overlap by SAHI_OVERLAP, so the same real-world canthus
+    can be detected in 2+ neighbouring slices — this collapses
+    those duplicates down to the single highest-confidence box.
+    """
+    if not dets:
+        return []
+    dets = sorted(dets, key=lambda d: d[1], reverse=True)
+    kept = []
+    used = [False] * len(dets)
+
+    for i, (box_i, conf_i) in enumerate(dets):
+        if used[i]:
+            continue
+        kept.append((box_i, conf_i))
+        for j in range(i + 1, len(dets)):
+            if used[j]:
+                continue
+            box_j, _ = dets[j]
+            if _iou(box_i, box_j) > SAHI_MERGE_IOU:
+                used[j] = True
+    return kept
+
+
+def _single_stage_detect(model, bgr: np.ndarray):
+    """
+    SAHI-style sliced inference for the single-stage canthus model.
+
+    The frame is cut into overlapping SAHI_SLICE_H x SAHI_SLICE_W
+    tiles (matching the geometry best.pt was trained on). Each tile
+    is run through the detector independently at imgsz=IMG_SIZE,
+    conf=CONF_THRESH, and every detection is mapped back into
+    full-frame pixel coordinates. Detections from overlapping tiles
+    are then merged per-class with NMS, and the single highest
+    confidence box per class is returned.
+
+    Returns (left_pt, right_pt, left_conf, right_conf) in full-frame
+    pixel coords. Either point may be None if that class wasn't found
+    anywhere in the frame — both points are NOT required.
+    """
+    prepped = _preprocess(bgr)
+    h, w = prepped.shape[:2]
+
+    left_dets  = []  # list of (box_xyxy_fullframe, conf)
+    right_dets = []
+
+    for (x1, y1, x2, y2) in _make_slices(w, h):
+        patch = prepped[y1:y2, x1:x2]
+        if patch.size == 0:
+            continue
+
+        # Upscale the slice before inference. At long range the
+        # canthus is only a few pixels wide even within a small slice
+        # — enlarging the patch (without changing what it depicts)
+        # gives the model's internal stride/downsampling stages more
+        # effective resolution to work with, recovering detail that
+        # would otherwise be lost. This does NOT add real information,
+        # but it avoids losing the little information that exists to
+        # the network's own downsampling.
+        if SAHI_UPSCALE != 1.0:
+            patch_in = cv2.resize(
+                patch, None, fx=SAHI_UPSCALE, fy=SAHI_UPSCALE,
+                interpolation=cv2.INTER_CUBIC)
+        else:
+            patch_in = patch
+
+        results = model(patch_in, imgsz=IMG_SIZE, conf=CONF_THRESH, verbose=False)[0]
+
+        if results.boxes is not None and len(results.boxes) > 0:
+            print(f"slice ({x1},{y1})-({x2},{y2}): "
+                  f"max_conf={results.boxes.conf.max():.3f}, "
+                  f"cls={results.boxes.cls.cpu().numpy().astype(int).tolist()}")
+
+        if results.boxes is None or len(results.boxes) == 0:
+            continue
+
+        boxes = results.boxes.xyxy.cpu().numpy()
+        clss  = results.boxes.cls.cpu().numpy().astype(int)
+        confs = results.boxes.conf.cpu().numpy()
+
+        for box, cls_id, conf in zip(boxes, clss, confs):
+            # box is in upscaled-patch coords -> divide back down to
+            # original slice-local coords -> then add slice offset to
+            # land in full-frame coords.
+            full_box = (
+                float(box[0] / SAHI_UPSCALE + x1),
+                float(box[1] / SAHI_UPSCALE + y1),
+                float(box[2] / SAHI_UPSCALE + x1),
+                float(box[3] / SAHI_UPSCALE + y1),
+            )
+            if cls_id == CLASS_LEFT:
+                left_dets.append((full_box, float(conf)))
+            elif cls_id == CLASS_RIGHT:
+                right_dets.append((full_box, float(conf)))
+
+    left_dets  = _nms_merge(left_dets)
+    right_dets = _nms_merge(right_dets)
+
+    left_pt  = None
+    right_pt = None
+    left_conf  = 0.0
+    right_conf = 0.0
+
+    if left_dets:
+        (lx1, ly1, lx2, ly2), left_conf = max(left_dets, key=lambda d: d[1])
+        left_pt = (float((lx1 + lx2) / 2.0), float((ly1 + ly2) / 2.0))
+
+    if right_dets:
+        (rx1, ry1, rx2, ry2), right_conf = max(right_dets, key=lambda d: d[1])
+        right_pt = (float((rx1 + rx2) / 2.0), float((ry1 + ry2) / 2.0))
+
+    return left_pt, right_pt, left_conf, right_conf
+
+# =============================================================
+# CONFIGURATION
+# =============================================================
+USE_BME280             = True
+BME280_PORT            = 7
+BME280_ADDRESS         = 0x76
+CALIB_AMBIENT          = 23.0
+EMISSIVITY              = 0.98
+MAX_NO_DETECT          = 3
+AUTO_SNAPSHOT_INTERVAL = 30
+LOG_FILE = os.path.expanduser("~/temperature_log.csv")
+SNAP_DIR = os.path.expanduser("~/snapshots")
+
+# Stability parameters
+STABILITY_FRAMES = 10
+STABILITY_WARMUP = 2.0
+STABILITY_THRESH = 0.5
+STABILITY_CHECKS = 5
+
+# Quality filters
+SPIKE_GUARD_DELTA   = 1.5
+ROLLING_WINDOW      = 5
+SYMMETRY_THRESH     = 1.5
+FEVER_CONFIRM_COUNT = 2
+
+# Classification thresholds (SPIRIT 2025)
+THRESH_NO_FACE    = 28.0
+THRESH_NORMAL     = 37.1
+THRESH_LOW_FEVER  = 37.5
+THRESH_HIGH_FEVER = 39.0
+
+# =============================================================
+# AMBIENT COMPENSATION (Pan et al. 2025, MMC)
+# =============================================================
+def compensate(t_raw, t_ambient):
+    return t_raw - (1.0 - EMISSIVITY) * (t_ambient - CALIB_AMBIENT)
+
+def get_ambient():
+    if USE_BME280:
+        try:
+            import smbus2, bme280
+            bus    = smbus2.SMBus(BME280_PORT)
+            params = bme280.load_calibration_params(bus, BME280_ADDRESS)
+            data   = bme280.sample(bus, BME280_ADDRESS, params)
+            return data.temperature, data.humidity
+        except Exception as e:
+            print(f"BME280 read failed: {e} — using fallback")
+    if last_status[0] is not None:
+        return last_status[0].min_c, None
+    return CALIB_AMBIENT, None
+
+# =============================================================
+# CLASSIFICATION
+# =============================================================
+def classify(temp_c):
+    if temp_c < THRESH_NO_FACE:
+        return "NO FACE",    (128, 128, 128)
+    elif temp_c < THRESH_NORMAL:
+        return "NORMAL",     (0, 255, 0)
+    elif temp_c < THRESH_LOW_FEVER:
+        return "LOW FEVER",  (0, 165, 255)
+    elif temp_c < THRESH_HIGH_FEVER:
+        return "HIGH FEVER", (0, 0, 255)
+    else:
+        return "EMERGENCY",  (0, 0, 180)
+
+def get_region_temp(temps, px, py, radius=3):
+    h, w = temps.shape
+    x1 = max(0, px - radius);  x2 = min(w, px + radius)
+    y1 = max(0, py - radius);  y2 = min(h, py + radius)
+    region = temps[y1:y2, x1:x2]
+    return float(np.max(region)) if region.size > 0 else 0.0
+
+# =============================================================
+# SYMMETRY CHECK
+# Only meaningful when BOTH canthi are present. With a single
+# canthus there is nothing to compare, so this is skipped upstream.
+# =============================================================
+def symmetry_check(lc: float, rc: float) -> bool:
+    diff = abs(lc - rc)
+    if diff > SYMMETRY_THRESH:
+        print(f"  [symmetry] rejected — "
+              f"LC:{lc:.1f} RC:{rc:.1f} "
+              f"diff:{diff:.1f}C > {SYMMETRY_THRESH}C")
+        return False
+    return True
+
+# =============================================================
+# FEVER CONFIRMATION
+# =============================================================
+def confirmed_classify(temp_c: float):
+    label, color = classify(temp_c)
+    if label in ("LOW FEVER", "HIGH FEVER", "EMERGENCY"):
+        fever_streak[0] += 1
+        if fever_streak[0] < FEVER_CONFIRM_COUNT:
+            print(f"  [fever confirm] {label} "
+                  f"{fever_streak[0]}/{FEVER_CONFIRM_COUNT} "
+                  f"— not yet confirmed")
+            return "NORMAL", (0, 255, 0)
+    else:
+        fever_streak[0] = 0
+    return label, color
+
+# =============================================================
+# SPIKE GUARD
+# =============================================================
+_rolling_temps = deque(maxlen=ROLLING_WINDOW)
+
+def spike_guard(new_temp: float) -> bool:
+    if len(_rolling_temps) < 3:
+        _rolling_temps.append(new_temp)
+        return True
+    avg = float(np.mean(_rolling_temps))
+    if abs(new_temp - avg) > SPIKE_GUARD_DELTA:
+        print(f"  [spike guard] rejected {new_temp:.1f}C "
+              f"(avg {avg:.1f}C  delta {abs(new_temp-avg):.1f}C)")
+        return False
+    _rolling_temps.append(new_temp)
+    return True
+
+# =============================================================
+# SCENE STABILITY CHECK
+# =============================================================
+def wait_for_stable_scene(timeout=8.0) -> bool:
+    print(f"  [stability] warming up {STABILITY_WARMUP}s...")
+    time.sleep(STABILITY_WARMUP)
+
+    recent_maxes = deque(maxlen=STABILITY_CHECKS)
+    stable_count = 0
+    t_start      = time.time()
+
+    while time.time() - t_start < timeout:
+        if last_frame[0] is not None and linear_cal.ready():
+            temps = linear_cal.decode(last_frame[0].y16)
+            recent_maxes.append(float(temps.max()))
+            if len(recent_maxes) == STABILITY_CHECKS:
+                spread = max(recent_maxes) - min(recent_maxes)
+                if spread < STABILITY_THRESH:
+                    stable_count += 1
+                    if stable_count >= 2:
+                        print(f"  [stability] scene stable "
+                              f"(spread {spread:.2f}C)")
+                        return True
+                else:
+                    stable_count = 0
+        time.sleep(0.2)
+
+    print("  [stability] timeout — proceeding anyway")
+    return False
+
+# =============================================================
+# FROZEN FRAME CAPTURE
+# =============================================================
+def capture_stable_frame(n_avg=10):
+    frozen = last_frame[0]
+    if frozen is None or not linear_cal.ready():
+        return None, None, None
+
+    decoded = []
+    for _ in range(n_avg):
+        try:
+            decoded.append(linear_cal.decode(frozen.y16))
+        except Exception:
+            pass
+
+    if not decoded:
+        return None, None, None
+
+    temps_avg = np.mean(decoded, axis=0)
+    palette   = g.Palette.IronRed
+    opts      = g.PaletteOptions(auto_range=True)
+    rgb       = g.apply_palette(frozen.y16, palette, opts)
+    bgr       = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+
+    return frozen, temps_avg, bgr
+
+# =============================================================
+# LOGGING
+# =============================================================
+def init_log():
+    os.makedirs(SNAP_DIR, exist_ok=True)
+    if not os.path.exists(LOG_FILE):
+        with open(LOG_FILE, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                "timestamp",
+                "lc_raw", "rc_raw", "canthus_raw",
+                "t_ambient", "humidity",
+                "lc_corrected", "rc_corrected", "canthus_corrected",
+                "lc_conf", "rc_conf", "sides_detected",
+                "lc_rc_diff",
+                "ambient_source", "classification",
+                "holding", "fever_streak"
+            ])
+
+def log_reading(lc_raw, rc_raw,
+                t_amb, humidity,
+                lc_corr, rc_corr,
+                lc_conf, rc_conf, sides_detected,
+                label, ambient_source,
+                holding, streak):
+    canthus_raw  = max(lc_raw,  rc_raw)
+    canthus_corr = max(lc_corr, rc_corr)
+    diff_str     = f"{abs(lc_raw-rc_raw):.2f}" if sides_detected == "both" else "N/A"
+    with open(LOG_FILE, 'a', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            f"{lc_raw:.2f}",   f"{rc_raw:.2f}",
+            f"{canthus_raw:.2f}",
+            f"{t_amb:.2f}",
+            f"{humidity:.1f}" if humidity else "N/A",
+            f"{lc_corr:.2f}",  f"{rc_corr:.2f}",
+            f"{canthus_corr:.2f}",
+            f"{lc_conf:.3f}",  f"{rc_conf:.3f}",
+            sides_detected,
+            diff_str,
+            ambient_source, label,
+            "yes" if holding else "no",
+            str(streak)
+        ])
+
+# =============================================================
+# DEBUG DISPLAY BUILDER
+# =============================================================
+def build_debug_display(frozen_frame, temps_avg, bgr_input,
+                        face_detected, sides_detected, holding,
+                        lc_raw, rc_raw,
+                        lc_corr, rc_corr,
+                        lc_conf, rc_conf,
+                        t_amb, humidity,
+                        label, color,
+                        lc_xy, rc_xy,
+                        ambient_source,
+                        streak):
+    h, w = temps_avg.shape
+
+    # Panel 1 — IronRed thermal
+    palette = g.Palette.IronRed
+    opts    = g.PaletteOptions(auto_range=True)
+    rgb     = g.apply_palette(frozen_frame.y16, palette, opts)
+    panel1  = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+    panel1  = cv2.resize(panel1, (w * 2, h * 2))
+
+    # Panel 2 — BGR fed to the model
+    panel2  = cv2.resize(bgr_input, (w * 2, h * 2))
+    cv2.putText(panel2,
+                f"LC conf:{lc_conf:.2f}  RC conf:{rc_conf:.2f}",
+                (10, 25), cv2.FONT_HERSHEY_SIMPLEX,
+                0.5, (200, 200, 200), 1)
+
+    if face_detected:
+        lc_x, lc_y = lc_xy
+        rc_x, rc_y = rc_xy
+        lc_x = int(lc_x) if lc_x is not None else None
+        lc_y = int(lc_y) if lc_y is not None else None
+        rc_x = int(rc_x) if rc_x is not None else None
+        rc_y = int(rc_y) if rc_y is not None else None
+
+        for panel in (panel1, panel2):
+            if lc_x is not None:
+                cv2.circle(panel, (lc_x*2, lc_y*2), 8, (0, 255, 255), 2)
+                cv2.putText(panel,
+                            f"LC r:{lc_raw:.1f} c:{lc_corr:.1f}",
+                            (lc_x*2 + 8, lc_y*2 - 8),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.4, (0, 255, 255), 1)
+            if rc_x is not None:
+                cv2.circle(panel, (rc_x*2, rc_y*2), 8, (0, 255, 255), 2)
+                cv2.putText(panel,
+                            f"RC r:{rc_raw:.1f} c:{rc_corr:.1f}",
+                            (rc_x*2 + 8, rc_y*2 - 8),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.4, (0, 255, 255), 1)
+            if lc_x is not None and rc_x is not None:
+                cv2.line(panel,
+                         (lc_x*2, lc_y*2), (rc_x*2, rc_y*2),
+                         (0, 255, 255), 1)
+
+        if sides_detected == "both":
+            diff       = abs(lc_raw - rc_raw)
+            diff_color = (0, 255, 0) if diff < SYMMETRY_THRESH else (0, 0, 255)
+            cv2.putText(panel1,
+                        f"LC-RC diff: {diff:.1f}C",
+                        (10, h*2 - 70),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.5, diff_color, 1)
+        else:
+            cv2.putText(panel1,
+                        f"Single canthus only ({sides_detected.upper()})",
+                        (10, h*2 - 70),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.5, (0, 165, 255), 1)
+
+        if streak > 0:
+            cv2.putText(panel1,
+                        f"Fever streak: {streak}/{FEVER_CONFIRM_COUNT}",
+                        (10, h*2 - 50),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.5, (0, 165, 255), 1)
+
+        if holding:
+            cv2.putText(panel1,
+                        "HOLDING PREV READING",
+                        (10, h*2 - 25),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.55, (0, 200, 255), 2)
+    else:
+        cv2.putText(panel1, "NO CANTHUS DETECTED",
+                    (20, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    1.0, (128, 128, 128), 2)
+
+    # Status bar
+    bar_h = 90
+    bar   = np.zeros((bar_h, w * 4, 3), dtype=np.uint8)
+
+    canthus_raw  = max(lc_raw,  rc_raw)
+    canthus_corr = max(lc_corr, rc_corr)
+    display_label = f"{label} (holding)" if holding else label
+
+    hum_str  = f"{humidity:.0f}%" if humidity else "N/A"
+    src_icon = "BME280" if USE_BME280 else "fallback"
+    amb_str  = (f"Ambient:{t_amb:.1f}C  RH:{hum_str}  "
+                f"[{src_icon}]  "
+                f"{datetime.now().strftime('%H:%M:%S')}")
+    diff_part = f"diff:{abs(lc_raw-rc_raw):.1f}C" if sides_detected == "both" else f"sides:{sides_detected}"
+    raw_str  = (f"RAW  LC:{lc_raw:.1f}  RC:{rc_raw:.1f}  "
+                f"Canthus:{canthus_raw:.1f}C  "
+                f"LCconf:{lc_conf:.2f} RCconf:{rc_conf:.2f}  "
+                f"{diff_part}")
+    cor_str  = (f"CORR LC:{lc_corr:.1f}  RC:{rc_corr:.1f}  "
+                f"Canthus:{canthus_corr:.1f}C")
+
+    cv2.putText(bar, amb_str,
+                (10, 22), cv2.FONT_HERSHEY_SIMPLEX,
+                0.55, (200, 200, 0), 1)
+    cv2.putText(bar, raw_str,
+                (10, 48), cv2.FONT_HERSHEY_SIMPLEX,
+                0.5, (180, 180, 180), 1)
+    cv2.putText(bar, cor_str,
+                (10, 72), cv2.FONT_HERSHEY_SIMPLEX,
+                0.5, color, 1)
+    cv2.putText(bar, display_label,
+                (w * 4 - 380, 62),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1.0, color, 2)
+
+    top     = np.hstack([panel1, panel2])
+    display = np.vstack([top, bar])
+    return display, canthus_corr
+
+# =============================================================
+# CAMERA STATE
+# =============================================================
+linear_cal      = g.CameraLinearCal()
+last_status     = [None]
+last_frame      = [None]
+last_valid      = [None]
+no_detect_count = [0]
+snapshot_count  = [0]
+last_snap_time  = [time.time()]
+fever_streak    = [0]
+
+def on_frame(frame):
+    last_frame[0] = frame
+    if last_status[0] is not None:
+        try:
+            linear_cal.fit(frame.y16, last_status[0])
+        except Exception:
+            pass
+
+# =============================================================
+# MAIN
+# =============================================================
+def main():
+    global IMG_SIZE, CONF_THRESH, SAHI_SLICE_H, SAHI_SLICE_W, SAHI_OVERLAP, SAHI_UPSCALE
+
+    ap = argparse.ArgumentParser(
+        description="Single-stage canthus detector (best.pt) with SAHI sliced inference")
+    ap.add_argument("--weights", default=None,
+                    help="Single-stage canthus model weights (best.pt)")
+    ap.add_argument("--port",    default="/dev/ttyACM0")
+    ap.add_argument("--imgsz",   type=int, default=IMG_SIZE,
+                    help="Inference image size fed to the model per slice")
+    ap.add_argument("--conf",    type=float, default=CONF_THRESH,
+                    help="Confidence threshold")
+    ap.add_argument("--slice-h", type=int, default=SAHI_SLICE_H,
+                    help="SAHI slice height in pixels (full-frame, pre-upscale)")
+    ap.add_argument("--slice-w", type=int, default=SAHI_SLICE_W,
+                    help="SAHI slice width in pixels (full-frame, pre-upscale)")
+    ap.add_argument("--overlap", type=float, default=SAHI_OVERLAP,
+                    help="SAHI fractional overlap between adjacent slices")
+    ap.add_argument("--upscale", type=float, default=SAHI_UPSCALE,
+                    help="Factor each slice is upscaled by before inference "
+                         "(helps recover small/far targets; 1.0 disables)")
+    args = ap.parse_args()
+
+    IMG_SIZE     = args.imgsz
+    CONF_THRESH  = args.conf
+    SAHI_SLICE_H = args.slice_h
+    SAHI_SLICE_W = args.slice_w
+    SAHI_OVERLAP = args.overlap
+    SAHI_UPSCALE = args.upscale
+
+    # Resolve weights
+    if args.weights:
+        weights_path = Path(args.weights)
+    else:
+        candidates = [
+            Path(__file__).parent / "thermal-canthus-detector" / "detect.pt",
+            Path(__file__).parent / "detect.pt",
+            Path.home() / "thermal-canthus-detector" / "detect.pt",
+        ]
+        weights_path = next(
+            (p for p in candidates if p.exists()), candidates[0])
+
+    print(f"Single-stage canthus model: {weights_path}")
+    model = YOLO(str(weights_path))
+    print("Single-stage pipeline ready.")
+    print(f"Inference imgsz={IMG_SIZE}  conf={CONF_THRESH}  "
+          f"SAHI slice={SAHI_SLICE_W}x{SAHI_SLICE_H}  "
+          f"overlap={SAHI_OVERLAP}  upscale={SAHI_UPSCALE}x")
+
+    init_log()
+    print(f"Logging to:   {LOG_FILE}")
+    print(f"Snapshots to: {SNAP_DIR}")
+
+    cam = g.Camera(g.DeviceInfo(serial_port=args.port))
+    cam.configure_thermography(g.ThermographyConfig(emissivity=98))
+    cam.start(on_frame)
+    print("Warming up... 5 seconds")
+    time.sleep(5)
+
+    print("Calibrating...")
+    for _ in range(20):
+        try:
+            s = cam.serial().query_temp_status(retries=2, wait_seconds=1.5)
+            if s:
+                last_status[0] = s
+                if last_frame[0] is not None:
+                    linear_cal.fit(last_frame[0].y16, s)
+                print(f"Calibrated — min:{s.min_c:.1f}  max:{s.max_c:.1f}")
+                break
+        except Exception:
+            pass
+        time.sleep(1)
+
+    if not linear_cal.ready():
+        print("Calibration failed.")
+        cam.stop()
+        sys.exit(1)
+
+    print("Live view started.")
+    print("Q/Escape = quit  |  S = manual snapshot")
+    cv2.namedWindow("Thermal Health Monitor", cv2.WINDOW_NORMAL)
+
+    try:
+        while True:
+            # Refresh calibration
+            try:
+                s = cam.serial().query_temp_status(retries=1, wait_seconds=1.0)
+                if s and last_frame[0] is not None:
+                    last_status[0] = s
+                    linear_cal.fit(last_frame[0].y16, s)
+            except Exception:
+                pass
+
+            if last_frame[0] is None or not linear_cal.ready():
+                time.sleep(0.05)
+                continue
+
+            # Wait for scene to stabilise
+            wait_for_stable_scene(timeout=8.0)
+
+            # Freeze one consistent frame
+            frozen_frame, temps_avg, bgr = capture_stable_frame(
+                n_avg=STABILITY_FRAMES)
+            if frozen_frame is None:
+                print("Frame capture failed — retrying")
+                time.sleep(1)
+                continue
+
+            h, w = temps_avg.shape
+
+            # Ambient
+            t_amb, humidity = get_ambient()
+            ambient_source  = "BME280" if USE_BME280 else "min_c fallback"
+
+            # =================================================
+            # SINGLE STAGE + SAHI: canthus detector run on
+            # overlapping slices of the full frame, merged back
+            # into full-frame coordinates.
+            # Either canthus may be missing; that's fine.
+            # =================================================
+            try:
+                left_pt, right_pt, lc_conf, rc_conf = _single_stage_detect(
+                    model, bgr)
+            except Exception as exc:
+                print(f"Detection error: {exc}")
+                left_pt = right_pt = None
+                lc_conf = rc_conf = 0.0
+
+            face_detected = (left_pt is not None) or (right_pt is not None)
+            holding       = False
+            lc_corr       = 0.0
+            rc_corr       = 0.0
+            sides_detected = "none"
+
+            if face_detected:
+                if left_pt is not None and right_pt is not None:
+                    sides_detected = "both"
+                elif left_pt is not None:
+                    sides_detected = "left"
+                else:
+                    sides_detected = "right"
+
+                lc_x, lc_y = left_pt  if left_pt  is not None else (None, None)
+                rc_x, rc_y = right_pt if right_pt is not None else (None, None)
+
+                lc_raw = get_region_temp(temps_avg, int(lc_x), int(lc_y), radius=3) \
+                         if left_pt  is not None else 0.0
+                rc_raw = get_region_temp(temps_avg, int(rc_x), int(rc_y), radius=3) \
+                         if right_pt is not None else 0.0
+
+                canthus_raw = max(lc_raw, rc_raw)
+
+                # Symmetry check ONLY applies when BOTH sides are present.
+                # With a single canthus there's nothing to compare against,
+                # so we skip straight to spike guard.
+                passed_symmetry = True
+                if sides_detected == "both":
+                    passed_symmetry = symmetry_check(lc_raw, rc_raw)
+
+                if not passed_symmetry:
+                    if last_valid[0] is not None:
+                        r              = last_valid[0]
+                        lc_raw         = r["lc_raw"];   rc_raw    = r["rc_raw"]
+                        lc_corr        = r["lc_corr"];  rc_corr   = r["rc_corr"]
+                        label          = r["label"];    color     = r["color"]
+                        lc_xy          = r["lc_xy"];    rc_xy     = r["rc_xy"]
+                        lc_conf        = r["lc_conf"];  rc_conf   = r["rc_conf"]
+                        sides_detected = r["sides_detected"]
+                        holding        = True
+                    else:
+                        face_detected = False
+
+                elif not spike_guard(canthus_raw):
+                    if last_valid[0] is not None:
+                        r              = last_valid[0]
+                        lc_raw         = r["lc_raw"];   rc_raw    = r["rc_raw"]
+                        lc_corr        = r["lc_corr"];  rc_corr   = r["rc_corr"]
+                        label          = r["label"];    color     = r["color"]
+                        lc_xy          = r["lc_xy"];    rc_xy     = r["rc_xy"]
+                        lc_conf        = r["lc_conf"];  rc_conf   = r["rc_conf"]
+                        sides_detected = r["sides_detected"]
+                        holding        = True
+                    else:
+                        face_detected = False
+
+                else:
+                    # Correct whichever side(s) were actually detected.
+                    lc_corr = compensate(lc_raw, t_amb) if left_pt  is not None else 0.0
+                    rc_corr = compensate(rc_raw, t_amb) if right_pt is not None else 0.0
+                    canthus_corr = max(lc_corr, rc_corr)
+                    label, color = confirmed_classify(canthus_corr)
+                    lc_xy = (lc_x, lc_y) if left_pt  is not None else (None, None)
+                    rc_xy = (rc_x, rc_y) if right_pt is not None else (None, None)
+
+                    last_valid[0] = {
+                        "lc_raw":  lc_raw,  "rc_raw":  rc_raw,
+                        "lc_corr": lc_corr, "rc_corr": rc_corr,
+                        "label":   label,   "color":   color,
+                        "lc_xy":   lc_xy,   "rc_xy":   rc_xy,
+                        "lc_conf": lc_conf, "rc_conf": rc_conf,
+                        "sides_detected": sides_detected,
+                    }
+                    no_detect_count[0] = 0
+
+                if face_detected:
+                    log_reading(lc_raw, rc_raw,
+                                t_amb, humidity,
+                                lc_corr, rc_corr,
+                                lc_conf, rc_conf, sides_detected,
+                                label, ambient_source,
+                                holding, fever_streak[0])
+
+                    rh_str   = f"{humidity:.0f}%" if humidity else "N/A"
+                    hold_str = " [holding]" if holding else ""
+                    diff_str = f"diff:{abs(lc_raw-rc_raw):.1f}C  " if sides_detected == "both" else f"sides:{sides_detected}  "
+                    print(f"[{datetime.now().strftime('%H:%M:%S')}]  "
+                          f"Amb:{t_amb:.1f}C RH:{rh_str}  "
+                          f"LCconf:{lc_conf:.2f} RCconf:{rc_conf:.2f}  "
+                          f"{diff_str}"
+                          f"RAW LC:{lc_raw:.1f} RC:{rc_raw:.1f}  "
+                          f"CORR LC:{lc_corr:.1f} RC:{rc_corr:.1f}  "
+                          f"-> {label}{hold_str}")
+
+            elif last_valid[0] is not None \
+                    and no_detect_count[0] < MAX_NO_DETECT:
+                no_detect_count[0] += 1
+                r              = last_valid[0]
+                lc_raw         = r["lc_raw"];   rc_raw    = r["rc_raw"]
+                lc_corr        = r["lc_corr"];  rc_corr   = r["rc_corr"]
+                label          = r["label"];    color     = r["color"]
+                lc_xy          = r["lc_xy"];    rc_xy     = r["rc_xy"]
+                lc_conf        = r["lc_conf"];  rc_conf   = r["rc_conf"]
+                sides_detected = r["sides_detected"]
+                face_detected  = True
+                holding        = True
+                print(f"Holding last reading "
+                      f"({no_detect_count[0]}/{MAX_NO_DETECT})")
+
+            else:
+                last_valid[0]      = None
+                no_detect_count[0] = 0
+                fever_streak[0]    = 0
+                lc_raw = rc_raw = lc_corr = rc_corr = 0.0
+                lc_conf = rc_conf = 0.0
+                sides_detected = "none"
+                label, color = "NO FACE", (128, 128, 128)
+                lc_xy = rc_xy = (None, None)
+                face_detected = False
+                holding       = False
+                print("No canthus detected")
+
+            lc_xy = last_valid[0]["lc_xy"] if last_valid[0] else (None, None)
+            rc_xy = last_valid[0]["rc_xy"] if last_valid[0] else (None, None)
+
+            # Build display
+            display, _ = build_debug_display(
+                frozen_frame, temps_avg, bgr,
+                face_detected, sides_detected, holding,
+                lc_raw, rc_raw,
+                lc_corr, rc_corr,
+                lc_conf, rc_conf,
+                t_amb, humidity,
+                label, color,
+                lc_xy, rc_xy,
+                ambient_source,
+                fever_streak[0])
+
+            cv2.imshow("Thermal Health Monitor", display)
+            key = cv2.waitKey(30) & 0xFF
+
+            if key in (ord('q'), ord('Q'), 27):
+                print("Quitting...")
+                break
+            elif key in (ord('s'), ord('S')):
+                snapshot_count[0] += 1
+                fname = os.path.join(
+                    SNAP_DIR,
+                    f"snap_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                    f"_{snapshot_count[0]:03d}.png")
+                cv2.imwrite(fname, display)
+                print(f"Manual snapshot: {fname}")
+
+            now = time.time()
+            if now - last_snap_time[0] >= AUTO_SNAPSHOT_INTERVAL:
+                last_snap_time[0] = now
+                snapshot_count[0] += 1
+                fname = os.path.join(
+                    SNAP_DIR,
+                    f"snap_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                    f"_auto_{snapshot_count[0]:03d}.png")
+                cv2.imwrite(fname, display)
+                print(f"Auto snapshot: {fname}")
+
+    except KeyboardInterrupt:
+        print("\nStopped.")
+    finally:
+        cam.stop()
+        cv2.destroyAllWindows()
+        print(f"Log:       {LOG_FILE}")
+        print(f"Snapshots: {SNAP_DIR}")
+        print("Stopped.")
+
+
+if __name__ == "__main__":
+    main()
