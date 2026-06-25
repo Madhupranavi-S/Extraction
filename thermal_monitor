@@ -61,13 +61,24 @@ IMG_SIZE    = 320   # imgsz fed to the model per-slice
 # resize-up to reach the ~300px training scale) and merge results.
 TRAIN_CROP_PX = 300       # the actual training slice size (step 2 default)
 
-NEAR_SLICE_H = 220         # face fills more of a smaller crop when subject is close (~1m)
+# Field-tested: NEAR (220px) works well for 1m-1.5m. Above 1.5m the face
+# is small enough relative to a 140px FAR crop that it's mostly background
+# (confirmed: "face looks small" in the FAR tiles) -- so the old FAR config
+# was STILL too zoomed-out for >1.5m. The fix is a SMALLER crop (not more
+# upscale) so a smaller, farther face still fills the slice the way
+# training crops were face-filling. A third tier (FAR_2) covers >1.5m
+# specifically, rather than stretching one FAR config across 1.5m-2.5m+.
+NEAR_SLICE_H = 220         # ~1m-1.5m: face fills a bigger crop -- working well
 NEAR_SLICE_W = 220
 NEAR_UPSCALE = TRAIN_CROP_PX / NEAR_SLICE_W   # resize slice up to ~training scale
 
-FAR_SLICE_H = 140          # face needs a larger fraction of the 384x288 frame
-FAR_SLICE_W = 140          # captured per-slice when subject is farther (~2.5m)
+FAR_SLICE_H = 140          # ~1.5m-2m: smaller face -> smaller crop
+FAR_SLICE_W = 140
 FAR_UPSCALE = TRAIN_CROP_PX / FAR_SLICE_W
+
+FAR2_SLICE_H = 90          # >2m: face is small in-frame -- crop tight around
+FAR2_SLICE_W = 90          # it so it fills the slice, same as training did
+FAR2_UPSCALE = TRAIN_CROP_PX / FAR2_SLICE_W
 
 SAHI_OVERLAP   = 0.35     # fractional overlap between adjacent slices
                           # (higher than usual so a canthus sitting
@@ -224,29 +235,58 @@ def _run_pass(model, prepped, slice_w, slice_h, upscale, overlap):
 def _single_stage_detect(model, bgr: np.ndarray):
     """
     Multi-scale SAHI-style sliced inference for the single-stage
-    canthus model.
+    canthus model — run as a CASCADE rather than always running all
+    three passes.
 
-    Runs TWO slicing passes over the full frame — a "near" geometry
-    matched to the model's training scale, and a "far" geometry for
-    longer subject distances — because a single fixed scale under-
-    detects across a 1m-2.5m deployment range. Detections from BOTH
-    passes are pooled per-class before NMS, so whichever scale
-    actually matches the subject's real distance in a given frame
-    is the one that "wins" via confidence-ranked NMS.
+    Background: subject distance varies 1m-2.5m+, and a single fixed
+    slice scale under-detects across that range (a farther subject's
+    face is smaller in absolute pixels, so it needs a proportionally
+    smaller/tighter slice to still fill the slice the way training
+    crops were face-filling). Running all three passes (NEAR/FAR/FAR2)
+    every frame works, but on low-power hardware (Raspberry Pi /
+    Jetson-class) that's 53 model invocations per captured frame,
+    which is wasteful since on any given frame only ONE tier actually
+    matches the subject's real distance.
+
+    CASCADE STRATEGY: try NEAR first (cheapest: 6 slices). If both
+    canthi are already found with good confidence, stop there — no
+    need to spend more compute. Otherwise, only run the NEXT tier
+    (FAR, then FAR2) to look for whichever canthus/canthi are still
+    missing. This keeps the common case cheap (~6-12 slices/frame
+    instead of 53) while still falling all the way through to FAR2
+    on frames where the subject really is far away.
 
     Returns (left_pt, right_pt, left_conf, right_conf) in full-frame
     pixel coords. Either point may be None if that class wasn't found
-    anywhere in the frame — both points are NOT required.
+    in ANY tier — both points are NOT required.
     """
     prepped = _preprocess(bgr)
 
-    near_left, near_right = _run_pass(
-        model, prepped, NEAR_SLICE_W, NEAR_SLICE_H, NEAR_UPSCALE, SAHI_OVERLAP)
-    far_left, far_right = _run_pass(
-        model, prepped, FAR_SLICE_W, FAR_SLICE_H, FAR_UPSCALE, SAHI_OVERLAP)
+    tiers = [
+        (NEAR_SLICE_W, NEAR_SLICE_H, NEAR_UPSCALE),
+        (FAR_SLICE_W,  FAR_SLICE_H,  FAR_UPSCALE),
+        (FAR2_SLICE_W, FAR2_SLICE_H, FAR2_UPSCALE),
+    ]
 
-    left_dets  = _nms_merge(near_left + far_left)
-    right_dets = _nms_merge(near_right + far_right)
+    all_left_dets  = []
+    all_right_dets = []
+
+    for slice_w, slice_h, upscale in tiers:
+        left_dets, right_dets = _run_pass(
+            model, prepped, slice_w, slice_h, upscale, SAHI_OVERLAP)
+        all_left_dets  += left_dets
+        all_right_dets += right_dets
+
+        # Stop early once BOTH sides have at least one confident hit —
+        # merging across what we already pooled is enough; no need to
+        # pay for the remaining tier(s) on this frame.
+        have_left  = any(conf >= CONF_THRESH for _, conf in all_left_dets)
+        have_right = any(conf >= CONF_THRESH for _, conf in all_right_dets)
+        if have_left and have_right:
+            break
+
+    left_dets  = _nms_merge(all_left_dets)
+    right_dets = _nms_merge(all_right_dets)
 
     left_pt  = None
     right_pt = None
@@ -642,6 +682,7 @@ def main():
     global IMG_SIZE, CONF_THRESH
     global NEAR_SLICE_H, NEAR_SLICE_W, NEAR_UPSCALE
     global FAR_SLICE_H, FAR_SLICE_W, FAR_UPSCALE
+    global FAR2_SLICE_H, FAR2_SLICE_W, FAR2_UPSCALE
     global SAHI_SLICE_H, SAHI_SLICE_W, SAHI_OVERLAP, SAHI_UPSCALE
 
     ap = argparse.ArgumentParser(
@@ -655,20 +696,29 @@ def main():
                     help="Confidence threshold")
     ap.add_argument("--overlap", type=float, default=SAHI_OVERLAP,
                     help="SAHI fractional overlap between adjacent slices")
-    # Far-range (original) overrides
+    # Far-range (~1.5-2m) overrides
     ap.add_argument("--slice-h", type=int, default=FAR_SLICE_H,
-                    help="FAR-range SAHI slice height in pixels (pre-upscale)")
+                    help="FAR-range (~1.5-2m) SAHI slice height in pixels (pre-upscale)")
     ap.add_argument("--slice-w", type=int, default=FAR_SLICE_W,
-                    help="FAR-range SAHI slice width in pixels (pre-upscale)")
+                    help="FAR-range (~1.5-2m) SAHI slice width in pixels (pre-upscale)")
     ap.add_argument("--upscale", type=float, default=FAR_UPSCALE,
-                    help="FAR-range upscale factor before inference")
-    # Near-range overrides (new)
+                    help="FAR-range (~1.5-2m) upscale factor before inference")
+    # Near-range (~1-1.5m) overrides
     ap.add_argument("--near-slice-h", type=int, default=NEAR_SLICE_H,
-                    help="NEAR-range SAHI slice height in pixels (pre-upscale)")
+                    help="NEAR-range (~1-1.5m) SAHI slice height in pixels (pre-upscale)")
     ap.add_argument("--near-slice-w", type=int, default=NEAR_SLICE_W,
-                    help="NEAR-range SAHI slice width in pixels (pre-upscale)")
+                    help="NEAR-range (~1-1.5m) SAHI slice width in pixels (pre-upscale)")
     ap.add_argument("--near-upscale", type=float, default=NEAR_UPSCALE,
-                    help="NEAR-range upscale factor before inference")
+                    help="NEAR-range (~1-1.5m) upscale factor before inference")
+    # Far2-range (>2m) overrides — added because the FAR config alone
+    # still missed detections above ~1.5m (face too small relative to
+    # the FAR crop size); this tier uses a smaller, tighter crop.
+    ap.add_argument("--far2-slice-h", type=int, default=FAR2_SLICE_H,
+                    help="FAR2-range (>~2m) SAHI slice height in pixels (pre-upscale)")
+    ap.add_argument("--far2-slice-w", type=int, default=FAR2_SLICE_W,
+                    help="FAR2-range (>~2m) SAHI slice width in pixels (pre-upscale)")
+    ap.add_argument("--far2-upscale", type=float, default=FAR2_UPSCALE,
+                    help="FAR2-range (>~2m) upscale factor before inference")
     args = ap.parse_args()
 
     IMG_SIZE     = args.imgsz
@@ -686,6 +736,10 @@ def main():
     NEAR_SLICE_W = args.near_slice_w
     NEAR_UPSCALE = args.near_upscale
 
+    FAR2_SLICE_H = args.far2_slice_h
+    FAR2_SLICE_W = args.far2_slice_w
+    FAR2_UPSCALE = args.far2_upscale
+
     # Resolve weights
     if args.weights:
         weights_path = Path(args.weights)
@@ -702,8 +756,9 @@ def main():
     model = YOLO(str(weights_path))
     print("Single-stage pipeline ready.")
     print(f"Inference imgsz={IMG_SIZE}  conf={CONF_THRESH}  overlap={SAHI_OVERLAP}")
-    print(f"  NEAR pass: slice={NEAR_SLICE_W}x{NEAR_SLICE_H}  upscale={NEAR_UPSCALE}x")
-    print(f"  FAR  pass: slice={FAR_SLICE_W}x{FAR_SLICE_H}  upscale={FAR_UPSCALE}x")
+    print(f"  NEAR pass (~1-1.5m): slice={NEAR_SLICE_W}x{NEAR_SLICE_H}  upscale={NEAR_UPSCALE:.2f}x")
+    print(f"  FAR  pass (~1.5-2m): slice={FAR_SLICE_W}x{FAR_SLICE_H}  upscale={FAR_UPSCALE:.2f}x")
+    print(f"  FAR2 pass (>2m):     slice={FAR2_SLICE_W}x{FAR2_SLICE_H}  upscale={FAR2_UPSCALE:.2f}x")
 
     init_log()
     print(f"Logging to:   {LOG_FILE}")
