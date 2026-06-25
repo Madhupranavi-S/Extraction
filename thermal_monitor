@@ -25,9 +25,8 @@ from ultralytics import YOLO
 CLASS_LEFT  = 0
 CLASS_RIGHT = 1
 
-# Base confidence threshold — lowered slightly so far/small targets
-# are not immediately discarded. Adaptive per-detection logic below
-# will tighten this for close subjects automatically.
+# Base confidence threshold — used as a fallback / CLI override.
+# Real per-tier floors live in SAHI_CONFIGS below (Phase 1 change).
 CONF_THRESH = 0.20
 IMG_SIZE    = 320   # imgsz fed to the model per-slice
 
@@ -37,20 +36,49 @@ IMG_SIZE    = 320   # imgsz fed to the model per-slice
 # and far subjects without a single fixed tile size cutting off
 # the canthus or losing spatial context.
 #
-#  tier 0 — CLOSE  (arm's length, ~0.5–1.5 m): large tiles so the
+#  tier 0 — CLOSE  (arm's length, ~0.5-1.5 m): large tiles so the
 #            model has plenty of surrounding eye context.
-#  tier 1 — MID    (~1.5–3 m): original safe geometry.
+#  tier 1 — MID    (~1.5-3 m): original safe geometry.
 #  tier 2 — FAR    (>3 m): small tiles + aggressive upscale.
 #
-# Each tuple: (slice_w, slice_h, overlap, upscale)
+# --- PHASE 1 CHANGE ---
+# Each tuple now carries its OWN confidence floor as a 5th value:
+#   (slice_w, slice_h, overlap, upscale, conf_floor)
+#
+# Why: tier 2 uses tiny 64x48 tiles upscaled 3.5x. Small tiles see
+# less context per inference and structurally produce more
+# low-confidence noise than tier 0's large tiles. One global
+# CONF_THRESH for all three tiers means it's always wrong for at
+# least one tier — too loose for far, or too strict for close.
+#
+# Starting values below are reasonable defaults, not measured —
+# tune live by watching which tier's hits look like noise in your
+# logs once VERBOSE_SAHI is turned on for a debugging session.
 # =============================================================
 SAHI_CONFIGS = [
-    (128, 96,  0.35, 1.5),   # tier 0 — close
-    (96,  72,  0.40, 2.0),   # tier 1 — mid   (original)
-    (64,  48,  0.50, 3.5),   # tier 2 — far
+    (128, 96,  0.35, 1.5, 0.22),   # tier 0 - close  (slightly stricter: large context, less noise expected)
+    (96,  72,  0.40, 2.0, 0.20),   # tier 1 - mid    (original baseline)
+    (64,  48,  0.50, 3.5, 0.28),   # tier 2 - far    (stricter: tiny tiles + heavy upscale = more noise)
 ]
 
 SAHI_MERGE_IOU = 0.30   # IoU threshold for cross-slice NMS
+
+# --- PHASE 1 CHANGE ---
+# Hard noise floor applied to EVERY detection before it is even
+# added to the NMS candidate pool, regardless of tier. This is
+# the actual fix for "ghost canthus" hits like conf=0.054 surviving
+# to become the final answer (previously: no competing detection
+# for that class -> the lone ghost wins by default since NMS only
+# suppresses duplicates, it doesn't reject low absolute confidence).
+HARD_CONF_FLOOR = 0.18
+
+# --- PHASE 1 CHANGE ---
+# After NMS, additionally discard any kept detection that sits far
+# below the best detection of the SAME class. A real canthus and a
+# ghost rarely overlap enough for IoU-NMS to merge them (that's why
+# the ghost survives NMS in the first place) — so we also gate on
+# relative confidence gap as a second, independent filter.
+GHOST_RELATIVE_GAP = 0.35
 
 
 # =============================================================
@@ -147,6 +175,13 @@ def _nms_merge(dets):
     Greedy NMS over [(box_xyxy, conf)] for a single class.
     Collapses duplicates from overlapping tiles down to the
     single highest-confidence box.
+
+    --- PHASE 1 CHANGE ---
+    After standard IoU-NMS, also drop any surviving detection whose
+    confidence is more than GHOST_RELATIVE_GAP below the top
+    detection. A ghost (e.g. nose bridge misread as a canthus while
+    turning) is usually spatially SEPARATE from the real detection,
+    so IoU-NMS alone never touches it — this second pass catches it.
     """
     if not dets:
         return []
@@ -160,17 +195,76 @@ def _nms_merge(dets):
         for j in range(i + 1, len(dets)):
             if not used[j] and _iou(box_i, dets[j][0]) > SAHI_MERGE_IOU:
                 used[j] = True
+
+    if not kept:
+        return kept
+    top_conf = kept[0][1]
+    before_n = len(kept)
+    kept = [(box, c) for box, c in kept if c >= top_conf - GHOST_RELATIVE_GAP]
+    dropped_n = before_n - len(kept)
+    if dropped_n > 0:
+        print(f"  [ghost filter] dropped {dropped_n} detection(s) "
+              f">{GHOST_RELATIVE_GAP:.2f} below top conf {top_conf:.3f}")
     return kept
 
 
 # =============================================================
-# WHOLE-FRAME SANITY CHECK  (diagnostic only)
+# GEOMETRIC PLAUSIBILITY CHECK
+# =============================================================
+def _plausibility_check(left_pt, right_pt, frame_w, frame_h) -> bool:
+    """
+    Reject detection pairs that are geometrically implausible for
+    two inner canthi on a human face. This is what actually catches
+    the "face turning -> ghost paired with real detection" failure
+    mode, independent of confidence — a ghost from the nose bridge
+    can have high-ish confidence but will usually be spatially wrong.
+    """
+    if left_pt is None or right_pt is None:
+        return True  # single canthus is always plausible
+
+    lx, ly = left_pt
+    rx, ry = right_pt
+
+    dx = abs(rx - lx)
+    dy = abs(ry - ly)
+
+    # Canthi must be horizontally separated by at least 5% of frame width
+    if dx < frame_w * 0.05:
+        print(f"  [plausibility] rejected — canthi too close horizontally "
+              f"dx={dx:.1f}px (min {frame_w*0.05:.1f}px)")
+        return False
+
+    # Vertical offset should be small — canthi are at roughly same height.
+    # Allow up to 15% of frame height for head tilt.
+    if dy > frame_h * 0.15:
+        print(f"  [plausibility] rejected — canthi vertical offset too large "
+              f"dy={dy:.1f}px (max {frame_h*0.15:.1f}px)")
+        return False
+
+    # Left canthus x should be LEFT of right canthus x (camera's
+    # perspective, mirrored). Allow a small tolerance for NMS centre error.
+    if lx > rx + frame_w * 0.05:
+        print(f"  [plausibility] rejected — canthi swapped: "
+              f"LC.x={lx:.1f} > RC.x={rx:.1f}")
+        return False
+
+    return True
+
+
+# =============================================================
+# WHOLE-FRAME SANITY CHECK  (diagnostic only — OFF by default)
 # =============================================================
 def _sanity_check_whole_frame(model, bgr: np.ndarray):
     """
     Run the model on the full frame at conf=0.05.
     If this finds nothing, the problem is weights/preprocessing,
-    not slice geometry. Disable by setting SANITY_CHECK=False.
+    not slice geometry.
+
+    --- PHASE 1 CHANGE ---
+    This used to run unconditionally every cycle, adding a full
+    extra inference pass per frame purely for logging. It is now
+    gated behind SANITY_CHECK, which defaults to False (see CLI
+    --debug-sanity to re-enable for a debugging session).
     """
     results = model(bgr, imgsz=IMG_SIZE, conf=0.05, verbose=False)[0]
     if results.boxes is not None and len(results.boxes) > 0:
@@ -196,6 +290,15 @@ def _single_stage_detect(model, bgr: np.ndarray,
     pixel coordinates then merged per-class with NMS. The single
     highest-confidence box per class is returned.
 
+    --- PHASE 1 CHANGE ---
+    Each tier now applies its OWN confidence floor (from
+    SAHI_CONFIGS) at inference time, AND every detection is checked
+    against the global HARD_CONF_FLOOR before being added to the
+    candidate pool. Both gates exist before NMS — cheaper (skips
+    work downstream) and more correct (a lone ghost with no
+    same-class competitor used to win by default; now it never
+    enters the pool at all).
+
     Parameters
     ----------
     model   : loaded YOLO model
@@ -219,16 +322,24 @@ def _single_stage_detect(model, bgr: np.ndarray,
     right_dets = []
     total_slices = 0
     total_hits   = 0
+    total_floored = 0
 
-    for tier_idx, (sw, sh, overlap, upscale) in enumerate(SAHI_CONFIGS):
+    for tier_idx, (sw, sh, overlap, upscale, tier_conf_floor) in enumerate(SAHI_CONFIGS):
         slices = _make_slices(w, h, sw, sh, overlap)
         total_slices += len(slices)
+
+        # Run inference at the LOWER of the tier floor / hard floor so we
+        # can still see (and log) borderline hits, but gate them below.
+        # Using a slightly lower model-level conf than our final gate
+        # avoids the model's internal NMS silently discarding candidates
+        # we might still want to inspect when verbose.
+        model_conf = min(tier_conf_floor, HARD_CONF_FLOOR)
 
         if verbose:
             print(f"[SAHI] tier={tier_idx}  "
                   f"tile={sw}x{sh}  overlap={overlap}  upscale={upscale}x  "
                   f"-> model input {int(sw*upscale)}x{int(sh*upscale)}  "
-                  f"slices={len(slices)}")
+                  f"slices={len(slices)}  conf_floor={tier_conf_floor}")
 
         for (x1, y1, x2, y2) in slices:
             patch = prepped[y1:y2, x1:x2]
@@ -246,7 +357,7 @@ def _single_stage_detect(model, bgr: np.ndarray,
 
             results = model(
                 patch_in, imgsz=IMG_SIZE,
-                conf=CONF_THRESH, verbose=False)[0]
+                conf=model_conf, verbose=False)[0]
 
             if results.boxes is None or len(results.boxes) == 0:
                 continue
@@ -262,6 +373,12 @@ def _single_stage_detect(model, bgr: np.ndarray,
                       f"conf={confs.round(3)}  cls={clss.tolist()}")
 
             for box, cls_id, conf in zip(boxes, clss, confs):
+                # --- PHASE 1 CHANGE: per-tier + hard floor gate ---
+                # Reject here, before the detection ever reaches NMS.
+                if conf < tier_conf_floor or conf < HARD_CONF_FLOOR:
+                    total_floored += 1
+                    continue
+
                 # Map from upscaled-patch coords -> full-frame coords
                 full_box = (
                     float(box[0] / upscale + x1),
@@ -276,10 +393,11 @@ def _single_stage_detect(model, bgr: np.ndarray,
 
     if verbose:
         print(f"[SAHI] Total slices across all tiers: {total_slices}  "
-              f"raw hits: {total_hits}  "
+              f"raw hits: {total_hits}  floored out: {total_floored}  "
               f"left raw: {len(left_dets)}  right raw: {len(right_dets)}")
 
-    # Per-class NMS to collapse cross-tile / cross-tier duplicates
+    # Per-class NMS + ghost-gap filter to collapse cross-tile/tier
+    # duplicates and drop low-confidence outliers (see _nms_merge).
     left_dets  = _nms_merge(left_dets)
     right_dets = _nms_merge(right_dets)
 
@@ -297,6 +415,20 @@ def _single_stage_detect(model, bgr: np.ndarray,
         (rx1, ry1, rx2, ry2), right_conf = max(right_dets, key=lambda d: d[1])
         right_pt = (float((rx1 + rx2) / 2.0),
                     float((ry1 + ry2) / 2.0))
+
+    # --- PHASE 1 CHANGE: geometric plausibility gate ---
+    # Catches the case both NMS passes can miss: a real detection on
+    # one side plus a spatially-separate ghost on the other side that
+    # happens to have survived its own tier's confidence floor (e.g.
+    # nose bridge misread as a canthus while the face is turning).
+    if not _plausibility_check(left_pt, right_pt, w, h):
+        # Demote to single canthus — keep whichever side has higher conf.
+        if left_conf >= right_conf:
+            right_pt   = None
+            right_conf = 0.0
+        else:
+            left_pt   = None
+            left_conf = 0.0
 
     return left_pt, right_pt, left_conf, right_conf
 
@@ -332,9 +464,13 @@ THRESH_NORMAL     = 37.1
 THRESH_LOW_FEVER  = 37.5
 THRESH_HIGH_FEVER = 39.0
 
-# Diagnostics — set both to False once the pipeline is tuned
-VERBOSE_SAHI   = True    # print per-slice and per-tier hit details
-SANITY_CHECK   = True    # run whole-frame check at conf=0.05 each cycle
+# --- PHASE 1 CHANGE ---
+# Both diagnostics now default to False. They were True before,
+# meaning every single frame paid for full per-slice console spam
+# AND a 4th full-frame inference pass. Re-enable with --debug-sahi /
+# --debug-sanity on the command line for a debugging session only.
+VERBOSE_SAHI   = False   # print per-slice and per-tier hit details
+SANITY_CHECK   = False   # run whole-frame check at conf=0.05 each cycle
 
 # Run _debug_preprocess() once on the first frame to confirm dtype/channels
 _preprocess_checked = [False]
@@ -692,21 +828,40 @@ def main():
     ap.add_argument("--port",     default="/dev/ttyACM0")
     ap.add_argument("--imgsz",    type=int,   default=IMG_SIZE,
                     help="Inference image size per slice (default 320)")
-    ap.add_argument("--conf",     type=float, default=CONF_THRESH,
-                    help="Base confidence threshold (default 0.20)")
-    ap.add_argument("--no-verbose", action="store_true",
-                    help="Suppress per-slice SAHI hit output")
-    ap.add_argument("--no-sanity",  action="store_true",
-                    help="Disable whole-frame sanity check each cycle")
+    ap.add_argument("--conf",     type=float, default=None,
+                    help="Override ALL tier confidence floors with one "
+                         "value (debugging convenience). Leave unset to "
+                         "use the per-tier floors in SAHI_CONFIGS.")
+    # --- PHASE 1 CHANGE ---
+    # Renamed from --no-verbose/--no-sanity (previously True by default)
+    # to --debug-sahi/--debug-sanity (now False by default). This is the
+    # actual behavior flip, not just a rename — both used to run on
+    # every frame unconditionally.
+    ap.add_argument("--debug-sahi", action="store_true",
+                    help="Print per-slice/per-tier SAHI hit details "
+                         "(default off — adds console overhead per frame)")
+    ap.add_argument("--debug-sanity", action="store_true",
+                    help="Run an extra whole-frame inference pass at "
+                         "conf=0.05 each cycle for diagnostics "
+                         "(default off — costs a full extra inference "
+                         "pass per frame)")
     ap.add_argument("--clahe",      action="store_true",
                     help="Enable CLAHE preprocessing (only if model was "
                          "trained with CLAHE augmentation)")
     args = ap.parse_args()
 
-    CONF_THRESH      = args.conf
-    VERBOSE_SAHI     = not args.no_verbose
-    SANITY_CHECK     = not args.no_sanity
+    VERBOSE_SAHI     = args.debug_sahi
+    SANITY_CHECK     = args.debug_sanity
     _CLAHE_ENABLED   = args.clahe
+
+    if args.conf is not None:
+        print(f"[CONFIG] --conf {args.conf} given — overriding ALL tier "
+              f"floors and HARD_CONF_FLOOR with this single value")
+        for i in range(len(SAHI_CONFIGS)):
+            sw, sh, ov, up, _ = SAHI_CONFIGS[i]
+            SAHI_CONFIGS[i] = (sw, sh, ov, up, args.conf)
+        globals()['HARD_CONF_FLOOR'] = min(globals()['HARD_CONF_FLOOR'], args.conf)
+        CONF_THRESH = args.conf
 
     # Resolve weights path
     if args.weights:
@@ -727,13 +882,14 @@ def main():
     model = YOLO(str(weights_path))
 
     print("Multi-scale SAHI pipeline ready.")
-    print(f"  conf={CONF_THRESH}  imgsz={args.imgsz}  "
-          f"clahe={_CLAHE_ENABLED}  "
-          f"verbose_sahi={VERBOSE_SAHI}  sanity={SANITY_CHECK}")
-    print("  Scale tiers (slice_w x slice_h  overlap  upscale):")
-    for i, (sw, sh, ov, up) in enumerate(SAHI_CONFIGS):
+    print(f"  imgsz={args.imgsz}  clahe={_CLAHE_ENABLED}  "
+          f"debug_sahi={VERBOSE_SAHI}  debug_sanity={SANITY_CHECK}  "
+          f"hard_conf_floor={HARD_CONF_FLOOR}  "
+          f"ghost_relative_gap={GHOST_RELATIVE_GAP}")
+    print("  Scale tiers (slice_w x slice_h  overlap  upscale  conf_floor):")
+    for i, (sw, sh, ov, up, cf) in enumerate(SAHI_CONFIGS):
         print(f"    tier {i}: {sw}x{sh}  overlap={ov}  upscale={up}x  "
-              f"-> model sees {int(sw*up)}x{int(sh*up)}")
+              f"conf_floor={cf}  -> model sees {int(sw*up)}x{int(sh*up)}")
 
     init_log()
     print(f"Logging to:   {LOG_FILE}")
@@ -842,25 +998,40 @@ def main():
 
                 canthus_raw = max(lc_raw, rc_raw)
 
-                # Symmetry check only when both sides detected
+                # Symmetry check only when both sides detected.
+                #
+                # --- PHASE 1 CHANGE ---
+                # On failure this NO LONGER falls through to "hold last
+                # reading". Holding is the right move when the model
+                # finds NOTHING (face genuinely out of frame / occluded
+                # entirely) — but here we DID find both canthi, they just
+                # disagree, almost always because the face is turning and
+                # one side is a partial/ghost read. The correct move is
+                # to drop to the more reliable (warmer = more
+                # camera-facing) single canthus and keep going, not
+                # freeze on a stale value.
                 passed_symmetry = True
                 if sides_detected == "both":
                     passed_symmetry = symmetry_check(lc_raw, rc_raw)
+                    if not passed_symmetry:
+                        if lc_raw >= rc_raw:
+                            print("  [symmetry fail] dropping to single "
+                                  "canthus — using LC")
+                            right_pt = None
+                            rc_raw   = 0.0
+                            rc_conf  = 0.0
+                            sides_detected = "left"
+                        else:
+                            print("  [symmetry fail] dropping to single "
+                                  "canthus — using RC")
+                            left_pt  = None
+                            lc_raw   = 0.0
+                            lc_conf  = 0.0
+                            sides_detected = "right"
+                        canthus_raw     = max(lc_raw, rc_raw)
+                        passed_symmetry = True  # allow through to spike guard
 
-                if not passed_symmetry:
-                    if last_valid[0] is not None:
-                        r = last_valid[0]
-                        lc_raw  = r["lc_raw"];   rc_raw  = r["rc_raw"]
-                        lc_corr = r["lc_corr"];  rc_corr = r["rc_corr"]
-                        label   = r["label"];    color   = r["color"]
-                        lc_xy   = r["lc_xy"];    rc_xy   = r["rc_xy"]
-                        lc_conf = r["lc_conf"];  rc_conf = r["rc_conf"]
-                        sides_detected = r["sides_detected"]
-                        holding = True
-                    else:
-                        face_detected = False
-
-                elif not spike_guard(canthus_raw):
+                if not spike_guard(canthus_raw):
                     if last_valid[0] is not None:
                         r = last_valid[0]
                         lc_raw  = r["lc_raw"];   rc_raw  = r["rc_raw"]
