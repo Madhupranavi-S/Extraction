@@ -1,0 +1,363 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Canthus Annotator</title>
+<style>
+  :root {
+    --bg: #14181c;
+    --panel: #1c2127;
+    --border: #2a313a;
+    --text: #e6e9ec;
+    --muted: #8b95a1;
+    --left-color: #4fd6c8;
+    --right-color: #f0a868;
+    --occluded: #555f6b;
+    --accent: #5b8cff;
+    --danger: #e0616b;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font-family: -apple-system, "Segoe UI", Helvetica, Arial, sans-serif;
+    height: 100vh; display: flex; flex-direction: column;
+  }
+  header {
+    padding: 10px 16px; border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+  }
+  header h1 { font-size: 15px; font-weight: 600; margin: 0; letter-spacing: 0.02em; }
+  header .sub { font-size: 12px; color: var(--muted); }
+  main { flex: 1; display: flex; min-height: 0; }
+  .canvas-area {
+    flex: 1; display: flex; align-items: center; justify-content: center;
+    background: #0c0f12; position: relative; overflow: hidden;
+  }
+  canvas { cursor: crosshair; image-rendering: pixelated; }
+  .sidebar {
+    width: 300px; border-left: 1px solid var(--border);
+    background: var(--panel); padding: 16px; overflow-y: auto;
+    display: flex; flex-direction: column; gap: 14px;
+  }
+  .field { display: flex; flex-direction: column; gap: 6px; }
+  .field label { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; }
+  .row { display: flex; gap: 8px; align-items: center; }
+  .point-row {
+    border: 1px solid var(--border); border-radius: 8px; padding: 10px;
+    display: flex; flex-direction: column; gap: 8px;
+  }
+  .point-row .dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; margin-right: 6px; }
+  .coord { font-family: ui-monospace, monospace; font-size: 12px; color: var(--muted); }
+  button {
+    background: #262c33; color: var(--text); border: 1px solid var(--border);
+    border-radius: 6px; padding: 7px 12px; font-size: 13px; cursor: pointer;
+  }
+  button:hover { background: #2e3640; }
+  button.active { border-color: var(--accent); color: var(--accent); }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #08111f; font-weight: 600; }
+  button.primary:hover { filter: brightness(1.08); }
+  button:disabled { opacity: 0.4; cursor: not-allowed; }
+  input[type=file] { color: var(--text); font-size: 12px; }
+  .toggle-group { display: flex; gap: 6px; }
+  .toggle-group button { flex: 1; font-size: 12px; }
+  .filelist { font-size: 12px; color: var(--muted); max-height: 90px; overflow-y: auto; }
+  .filelist .cur { color: var(--accent); }
+  .progress { font-size: 12px; color: var(--muted); }
+  footer {
+    border-top: 1px solid var(--border); padding: 8px 16px;
+    font-size: 12px; color: var(--muted); display: flex; justify-content: space-between;
+  }
+  .hint { font-size: 11px; color: var(--muted); line-height: 1.5; }
+  .badge { font-size: 11px; padding: 2px 6px; border-radius: 4px; background: #262c33; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>CANTHUS ANNOTATOR</h1>
+  <span class="sub">Click to place a point. L = left canthus, R = right canthus. Mark occluded sides as occluded instead of guessing.</span>
+</header>
+
+<main>
+  <div class="canvas-area">
+    <canvas id="cv"></canvas>
+  </div>
+
+  <div class="sidebar">
+    <div class="field">
+      <label>Load images</label>
+      <input id="fileInput" type="file" accept="image/*" multiple>
+      <div class="hint" style="margin-top:4px">Select all the image files inside your captures folder (click one, then Ctrl/Cmd+A or shift-click to select the rest).</div>
+    </div>
+    <div class="field">
+      <label>File</label>
+      <div class="progress" id="progress">No images loaded</div>
+      <div class="filelist" id="filelist"></div>
+    </div>
+
+    <div class="point-row">
+      <div class="row"><span class="dot" style="background:var(--left-color)"></span><b>Left canthus</b></div>
+      <div class="toggle-group">
+        <button id="leftVisibleBtn" class="active">Visible</button>
+        <button id="leftOccludedBtn">Occluded</button>
+      </div>
+      <div class="coord" id="leftCoord">x: —  y: —</div>
+    </div>
+
+    <div class="point-row">
+      <div class="row"><span class="dot" style="background:var(--right-color)"></span><b>Right canthus</b></div>
+      <div class="toggle-group">
+        <button id="rightVisibleBtn" class="active">Visible</button>
+        <button id="rightOccludedBtn">Occluded</button>
+      </div>
+      <div class="coord" id="rightCoord">x: —  y: —</div>
+    </div>
+
+    <div class="field">
+      <label>Active point to place on click</label>
+      <div class="toggle-group">
+        <button id="modeLeft" class="active">L (key: 1)</button>
+        <button id="modeRight">R (key: 2)</button>
+      </div>
+    </div>
+
+    <div class="field">
+      <label>Zoom</label>
+      <div class="row">
+        <button id="zoomOut">−</button>
+        <span id="zoomLabel" class="badge">100%</span>
+        <button id="zoomIn">+</button>
+        <button id="zoomReset">reset</button>
+      </div>
+    </div>
+
+    <div class="hint">
+      If a side is occluded, mark it "Occluded" (no point needed). If visible but you misclick, just click again to move it. Saved rows accumulate even if you revisit a file.
+    </div>
+
+    <div class="field" style="margin-top:auto">
+      <button id="saveRowBtn" class="primary">Save row &amp; next →</button>
+      <button id="exportBtn">Export annotations.csv</button>
+      <div class="progress" id="exportCount">0 rows saved</div>
+    </div>
+  </div>
+</main>
+
+<footer>
+  <span>Keys: 1/2 select point · O toggle occluded for active point · ← → navigate files · S save row</span>
+  <span id="metaInfo"></span>
+</footer>
+
+<script>
+const canvas = document.getElementById('cv');
+const ctx = canvas.getContext('2d');
+
+let files = [];
+let curIndex = -1;
+let img = new Image();
+let imgLoaded = false;
+let zoom = 1.0;
+
+const state = {
+  left:  { x: null, y: null, visible: true },
+  right: { x: null, y: null, visible: true },
+  activePoint: 'left'
+};
+
+const rows = []; // collected annotation rows
+
+const leftVisibleBtn = document.getElementById('leftVisibleBtn');
+const leftOccludedBtn = document.getElementById('leftOccludedBtn');
+const rightVisibleBtn = document.getElementById('rightVisibleBtn');
+const rightOccludedBtn = document.getElementById('rightOccludedBtn');
+const modeLeft = document.getElementById('modeLeft');
+const modeRight = document.getElementById('modeRight');
+
+function setActivePoint(p) {
+  state.activePoint = p;
+  modeLeft.classList.toggle('active', p === 'left');
+  modeRight.classList.toggle('active', p === 'right');
+}
+modeLeft.onclick = () => setActivePoint('left');
+modeRight.onclick = () => setActivePoint('right');
+
+function setVisibility(side, visible) {
+  state[side].visible = visible;
+  if (!visible) { state[side].x = null; state[side].y = null; }
+  refreshVisButtons();
+  redraw();
+}
+leftVisibleBtn.onclick  = () => setVisibility('left', true);
+leftOccludedBtn.onclick = () => setVisibility('left', false);
+rightVisibleBtn.onclick  = () => setVisibility('right', true);
+rightOccludedBtn.onclick = () => setVisibility('right', false);
+
+function refreshVisButtons() {
+  leftVisibleBtn.classList.toggle('active', state.left.visible);
+  leftOccludedBtn.classList.toggle('active', !state.left.visible);
+  rightVisibleBtn.classList.toggle('active', state.right.visible);
+  rightOccludedBtn.classList.toggle('active', !state.right.visible);
+}
+
+document.getElementById('fileInput').addEventListener('change', (e) => {
+  files = Array.from(e.target.files).filter(f => /\.(png|jpg|jpeg|bmp)$/i.test(f.name));
+  files.sort((a,b) => a.name.localeCompare(b.name));
+  curIndex = -1;
+  renderFileList();
+  if (files.length) loadImage(0);
+});
+
+function renderFileList() {
+  const el = document.getElementById('filelist');
+  el.innerHTML = files.map((f,i) =>
+    `<div class="${i===curIndex?'cur':''}">${i+1}. ${f.name}</div>`).join('');
+  document.getElementById('progress').textContent =
+    files.length ? `${curIndex+1} / ${files.length}` : 'No images loaded';
+}
+
+function resetPoints() {
+  state.left  = { x: null, y: null, visible: true };
+  state.right = { x: null, y: null, visible: true };
+  refreshVisButtons();
+  updateCoordLabels();
+}
+
+function loadImage(idx) {
+  if (idx < 0 || idx >= files.length) return;
+  curIndex = idx;
+  const reader = new FileReader();
+  reader.onload = (e) => {
+    img = new Image();
+    img.onload = () => {
+      imgLoaded = true;
+      zoom = 1.0;
+      document.getElementById('zoomLabel').textContent = '100%';
+      resetPoints();
+      redraw();
+    };
+    img.src = e.target.result;
+  };
+  reader.readAsDataURL(files[idx]);
+  renderFileList();
+  document.getElementById('metaInfo').textContent = files[idx].name;
+}
+
+function redraw() {
+  if (!imgLoaded) return;
+  const w = Math.round(img.width * zoom);
+  const h = Math.round(img.height * zoom);
+  canvas.width = w;
+  canvas.height = h;
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(img, 0, 0, w, h);
+
+  drawPoint(state.left, '#4fd6c8', 'L');
+  drawPoint(state.right, '#f0a868', 'R');
+}
+
+function drawPoint(p, color, label) {
+  if (p.x === null || p.y === null) return;
+  const cx = p.x * zoom, cy = p.y * zoom;
+  ctx.beginPath();
+  ctx.arc(cx, cy, 7, 0, Math.PI*2);
+  ctx.strokeStyle = color; ctx.lineWidth = 2;
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(cx-10, cy); ctx.lineTo(cx+10, cy);
+  ctx.moveTo(cx, cy-10); ctx.lineTo(cx, cy+10);
+  ctx.strokeStyle = color; ctx.lineWidth = 1;
+  ctx.stroke();
+  ctx.fillStyle = color;
+  ctx.font = '12px monospace';
+  ctx.fillText(label, cx+10, cy-10);
+}
+
+canvas.addEventListener('click', (e) => {
+  if (!imgLoaded) return;
+  const rect = canvas.getBoundingClientRect();
+  const x = (e.clientX - rect.left) / zoom;
+  const y = (e.clientY - rect.top) / zoom;
+  const side = state.activePoint;
+  state[side].x = Math.round(x);
+  state[side].y = Math.round(y);
+  state[side].visible = true;
+  refreshVisButtons();
+  updateCoordLabels();
+  redraw();
+});
+
+function updateCoordLabels() {
+  document.getElementById('leftCoord').textContent =
+    state.left.visible ? `x: ${state.left.x ?? '—'}  y: ${state.left.y ?? '—'}` : 'occluded';
+  document.getElementById('rightCoord').textContent =
+    state.right.visible ? `x: ${state.right.x ?? '—'}  y: ${state.right.y ?? '—'}` : 'occluded';
+}
+
+document.getElementById('zoomIn').onclick  = () => { zoom = Math.min(zoom*1.25, 8); document.getElementById('zoomLabel').textContent = Math.round(zoom*100)+'%'; redraw(); };
+document.getElementById('zoomOut').onclick = () => { zoom = Math.max(zoom/1.25, 0.25); document.getElementById('zoomLabel').textContent = Math.round(zoom*100)+'%'; redraw(); };
+document.getElementById('zoomReset').onclick = () => { zoom = 1; document.getElementById('zoomLabel').textContent = '100%'; redraw(); };
+
+function parseFilename(name) {
+  // expects pattern: subject_distanceM_occlusion_NNN.png  e.g. alice_2.0m_left_occluded_004.png
+  const base = name.replace(/\.[^.]+$/, '');
+  const parts = base.split('_');
+  let subject = parts[0] || '';
+  let distance = '';
+  let occlusion = 'unknown';
+  const distMatch = base.match(/([0-9]+(\.[0-9]+)?)m/);
+  if (distMatch) distance = distMatch[1];
+  if (base.includes('left_occluded')) occlusion = 'left_occluded';
+  else if (base.includes('right_occluded')) occlusion = 'right_occluded';
+  else if (base.includes('none')) occlusion = 'none';
+  return { subject, distance, occlusion };
+}
+
+function saveRow() {
+  if (!imgLoaded) return;
+  const f = files[curIndex];
+  const meta = parseFilename(f.name);
+  rows.push({
+    image_id: f.name.replace(/\.[^.]+$/, ''),
+    image_path: f.name,
+    subject_id: meta.subject,
+    distance_m: meta.distance,
+    occlusion: meta.occlusion,
+    gt_left_x: state.left.visible ? state.left.x : '',
+    gt_left_y: state.left.visible ? state.left.y : '',
+    gt_left_visible: state.left.visible ? 1 : 0,
+    gt_right_x: state.right.visible ? state.right.x : '',
+    gt_right_y: state.right.visible ? state.right.y : '',
+    gt_right_visible: state.right.visible ? 1 : 0
+  });
+  document.getElementById('exportCount').textContent = `${rows.length} rows saved`;
+}
+
+document.getElementById('saveRowBtn').onclick = () => {
+  saveRow();
+  if (curIndex < files.length - 1) loadImage(curIndex + 1);
+};
+
+document.getElementById('exportBtn').onclick = () => {
+  if (!rows.length) { alert('No rows saved yet.'); return; }
+  const headers = Object.keys(rows[0]);
+  const csv = [headers.join(',')].concat(
+    rows.map(r => headers.map(h => r[h]).join(','))
+  ).join('\n');
+  const blob = new Blob([csv], { type: 'text/csv' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'annotations.csv';
+  a.click();
+};
+
+window.addEventListener('keydown', (e) => {
+  if (e.key === '1') setActivePoint('left');
+  if (e.key === '2') setActivePoint('right');
+  if (e.key.toLowerCase() === 'o') setVisibility(state.activePoint, !state[state.activePoint].visible);
+  if (e.key.toLowerCase() === 's') saveRow();
+  if (e.key === 'ArrowRight' && curIndex < files.length - 1) loadImage(curIndex + 1);
+  if (e.key === 'ArrowLeft' && curIndex > 0) loadImage(curIndex - 1);
+});
+</script>
+</body>
+</html>
